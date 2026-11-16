@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>NayaPay HTML Receipt Fixtures</title>
+  <style>
+    body { font-family: Inter, Arial, sans-serif; background: #f8fafc; color: #0f172a; margin: 24px; }
+    .email-fixture { background: #ffffff; border: 1px solid #cbd5e1; border-radius: 10px; padding: 20px; margin-bottom: 24px; }
+    .np-brand { color: #ff5722; font-weight: 700; font-size: 16px; margin-bottom: 8px; }
+    table.receipt { width: 100%; border-collapse: collapse; margin: 12px 0; }
+    table.receipt td { border-bottom: 1px solid #e2e8f0; padding: 8px 6px; font-size: 14px; }
+    table.receipt td.lbl { color: #64748b; width: 45%; }
+    table.receipt td.val { font-weight: 600; text-align: right; }
+  </style>
+</head>
+<body>
+
+  <!-- 1. NayaPay Foodpanda POS / Card Receipt -->
+  <article
+    class="email-fixture"
+    data-email="true"
+    data-subject="NayaPay Card Transaction Receipt - FOODPANDA PAKISTAN"
+    data-sender="alerts@nayapay.com"
+    data-date="Sun, 8 Nov 2026 20:15:00 +0500"
+  >
+    <div class="np-brand">NayaPay Transaction Receipt</div>
+    <p>You paid <strong>Rs. 1,850.00</strong> to <strong>FOODPANDA PAKISTAN</strong> using your NayaPay Visa Card.</p>
+    <table class="receipt">
+      <tr><td class="lbl">Merchant Name</td><td class="val">FOODPANDA PAKISTAN</td></tr>
+      <tr><td class="lbl">Payment Method</td><td class="val">NayaPay Visa Debit Card</td></tr>
+      <tr><td class="lbl">Transaction Amount</td><td class="val">Rs. 1,850.00</td></tr>
+      <tr><td class="lbl">Date &amp; Time</td><td class="val">08 Nov 2026 08:15 PM</td></tr>
+      <tr><td class="lbl">Available Balance</td><td class="val">Rs. 18,150.00</td></tr>
+    </table>
+    <p>Thank you for using NayaPay.</p>
+  </article>
+
+  <!-- 2. NayaPay Netflix International Card Receipt with WHT + FX Fee -->
+  <article
+    class="email-fixture"
+    data-email="true"
+    data-subject="NayaPay International Card Transaction - NETFLIX.COM"
+    data-sender="alerts@nayapay.com"
+    data-date="Tue, 10 Nov 2026 10:30:00 +0500"
+  >
+    <div class="np-brand">NayaPay International Card Receipt</div>
+    <p>Your NayaPay Visa Virtual Card was charged for an international online purchase at <strong>NETFLIX.COM</strong>.</p>
+    <table class="receipt">
+      <tr><td class="lbl">Merchant Name</td><td class="val">NETFLIX.COM</td></tr>
+      <tr><td class="lbl">Payment Method</td><td class="val">NayaPay Visa Virtual Card</td></tr>
+      <tr><td class="lbl">Base Amount</td><td class="val">Rs. 1,100.00</td></tr>
+      <tr><td class="lbl">Withholding Tax (WHT)</td><td class="val">Rs. 110.00</td></tr>
+      <tr><td class="lbl">International FX Fee</td><td class="val">Rs. 55.00</td></tr>
+      <tr><td class="lbl">Total Charged</td><td class="val">Rs. 1,265.00</td></tr>
+      <tr><td class="lbl">Date &amp; Time</td><td class="val">10 Nov 2026 10:30 AM</td></tr>
+      <tr><td class="lbl">Wallet Balance</td><td class="val">Rs. 16,885.00</td></tr>
+    </table>
+    <p>International card transactions include FBR withholding tax and FX service charges.</p>
+  </article>
+
+  <!-- 3. NayaPay Raast Transfer to BYKEA -->
+  <article
+    class="email-fixture"
+    data-email="true"
+    data-subject="NayaPay Raast Money Sent - BYKEA"
+    data-sender="alerts@nayapay.com"
+    data-date="Mon, 9 Nov 2026 09:10:00 +0500"
+  >
+    <div class="np-brand">NayaPay Raast Transfer Receipt</div>
+    <p>Money Sent! You paid <strong>PKR 650.00</strong> via Raast to <strong>BYKEA</strong>.</p>
+    <table class="receipt">
+      <tr><td class="lbl">Payment Channel</td><td class="val">Raast</td></tr>
+      <tr><td class="lbl">Recipient Name</td><td class="val">BYKEA</td></tr>
+      <tr><td class="lbl">Receiver IBAN</td><td class="val">PK36MEZN0002110104567890</td></tr>
+      <tr><td class="lbl">Transfer Amount</td><td class="val">PKR 650.00</td></tr>
+      <tr><td class="lbl">Fee</td><td class="val">PKR 0.00</td></tr>
+      <tr><td class="lbl">Date &amp; Time</td><td class="val">09 Nov 2026 09:10 AM</td></tr>
+      <tr><td class="lbl">Remaining Balance</td><td class="val">Rs. 16,235.00</td></tr>
+    </table>
+    <p>Instant Raast transfer completed via NayaPay.</p>
+  </article>
+
+  <!-- 4. NayaPay Failed / OTP Alert (Must be skipped) -->
+  <article
+    class="email-fixture"
+    data-email="true"
+    data-subject="NayaPay Verification Code"
+    data-sender="alerts@nayapay.com"
+    data-date="Tue, 10 Nov 2026 11:00:00 +0500"
+  >
+    <div class="np-brand">NayaPay Security Alert</div>
+    <p>Your NayaPay One Time Password verification code is <strong>9355</strong>. Your previous card transaction was failed due to insufficient balance.</p>
+  </article>
+
+</body>
+</html>

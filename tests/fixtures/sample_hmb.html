@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>HabibMetro Outlook-Forwarded Email Fixtures</title>
+  <style>
+    body { font-family: Segoe UI, Arial, sans-serif; background: #f4f6f9; color: #1e293b; margin: 24px; }
+    .email-fixture { background: #ffffff; border: 1px solid #cbd5e1; border-radius: 8px; padding: 20px; margin-bottom: 24px; }
+    .outlook-hdr { font-size: 13px; color: #475569; border-bottom: 1px solid #e2e8f0; padding-bottom: 10px; margin-bottom: 14px; }
+    table.details { width: 100%; border-collapse: collapse; margin: 12px 0; }
+    table.details td { border: 1px solid #e2e8f0; padding: 8px 10px; font-size: 14px; }
+    table.details td.lbl { font-weight: 600; background: #f8fafc; width: 38%; }
+  </style>
+</head>
+<body>
+
+  <!-- 1. HabibMetro Bill Payment Debit: K-ELECTRIC -->
+  <article
+    class="email-fixture"
+    data-email="true"
+    data-subject="Fwd: HabibMetro Transaction Alert - Bill Payment"
+    data-sender="user@example.com"
+    data-date="Thu, 5 Nov 2026 14:20:00 +0500"
+  >
+    <div class="outlook-hdr">
+      <p>---------- Forwarded message ---------</p>
+      <p>
+        <strong>From:</strong> Habib Metro E-Service &lt;eservice@habibmetro.com&gt;<br>
+        <strong>Sent:</strong> Thursday, November 5, 2026 2:19 PM<br>
+        <strong>To:</strong> user@example.com<br>
+        <strong>Subject:</strong> HabibMetro Transaction Alert - Bill Payment
+      </p>
+    </div>
+    <div class="hmb-alert-body">
+      <p>Dear Valued Customer,</p>
+      <p>Your HabibMetro account <strong>****7890</strong> has been debited with <strong>PKR 14,500.00</strong> for a Utility Bill Payment.</p>
+      <table class="details">
+        <tr><td class="lbl">Account Number</td><td>****7890</td></tr>
+        <tr><td class="lbl">Transaction Type</td><td>Bill Payment</td></tr>
+        <tr><td class="lbl">Biller Name</td><td>K-ELECTRIC</td></tr>
+        <tr><td class="lbl">Consumer Number</td><td>0400012345678</td></tr>
+        <tr><td class="lbl">Transaction Amount</td><td>PKR 14,500.00</td></tr>
+        <tr><td class="lbl">Transaction Date &amp; Time</td><td>05-Nov-2026 14:18:00</td></tr>
+        <tr><td class="lbl">Available Balance</td><td>PKR 245,500.00</td></tr>
+      </table>
+      <p>Thank you for banking with HABIBMETRO.</p>
+    </div>
+  </article>
+
+  <!-- 2. HabibMetro -> NayaPay IBFT Top-Up (TRANSFER_INTERNAL) -->
+  <article
+    class="email-fixture"
+    data-email="true"
+    data-subject="Fwd: HabibMetro IBFT Debit Alert"
+    data-sender="user@example.com"
+    data-date="Fri, 6 Nov 2026 11:07:00 +0500"
+  >
+    <div class="outlook-hdr">
+      <p>________________________________</p>
+      <p>
+        <strong>From:</strong> Habib Metro E-Service &lt;eservice@habibmetro.com&gt;<br>
+        <strong>Sent:</strong> Friday, November 6, 2026 11:06 AM<br>
+        <strong>To:</strong> user@example.com<br>
+        <strong>Subject:</strong> HabibMetro IBFT Debit Alert
+      </p>
+    </div>
+    <div class="hmb-alert-body">
+      <p>Dear Customer,</p>
+      <p>Your HabibMetro account <strong>****7890</strong> has been debited with <strong>PKR 20,000.00</strong> via IBFT Fund Transfer.</p>
+      <table class="details">
+        <tr><td class="lbl">Account Number</td><td>****7890</td></tr>
+        <tr><td class="lbl">Payment Channel</td><td>IBFT</td></tr>
+        <tr><td class="lbl">To Account Title</td><td>NAYAPAY - DEMO ACCOUNT</td></tr>
+        <tr><td class="lbl">Bank Name</td><td>NayaPay</td></tr>
+        <tr><td class="lbl">To IBAN</td><td>PK12NAYA1234503001234567</td></tr>
+        <tr><td class="lbl">Transaction Amount</td><td>PKR 20,000.00</td></tr>
+        <tr><td class="lbl">Date &amp; Time</td><td>06-Nov-2026 11:05:00</td></tr>
+        <tr><td class="lbl">Available Balance</td><td>PKR 225,500.00</td></tr>
+      </table>
+      <p>Regards, Habib Metro E-Service</p>
+    </div>
+  </article>
+
+  <!-- 3. HabibMetro -> Al Meezan MRAF Sweep (TRANSFER_MMF) -->
+  <article
+    class="email-fixture"
+    data-email="true"
+    data-subject="Fwd: HabibMetro Fund Transfer Alert - Al Meezan"
+    data-sender="user@example.com"
+    data-date="Sat, 7 Nov 2026 09:42:00 +0500"
+  >
+    <div class="outlook-hdr">
+      <p>---------- Forwarded message ---------</p>
+      <p>
+        <strong>From:</strong> Habib Metro E-Service &lt;eservice@habibmetro.com&gt;<br>
+        <strong>Sent:</strong> Saturday, November 7, 2026 9:41 AM<br>
+        <strong>To:</strong> user@example.com<br>
+        <strong>Subject:</strong> HabibMetro Fund Transfer Alert - Al Meezan
+      </p>
+    </div>
+    <div class="hmb-alert-body">
+      <p>Dear Customer,</p>
+      <p>Your HabibMetro account <strong>****7890</strong> has been debited with <strong>PKR 55,000.00</strong> for an IBFT Funds Transfer.</p>
+      <table class="details">
+        <tr><td class="lbl">Account Number</td><td>****7890</td></tr>
+        <tr><td class="lbl">Payment Channel</td><td>IBFT</td></tr>
+        <tr><td class="lbl">Beneficiary Name</td><td>AL MEEZAN INVESTMENT - MRAF</td></tr>
+        <tr><td class="lbl">Bank Name</td><td>Meezan Bank Limited</td></tr>
+        <tr><td class="lbl">Transaction Amount</td><td>PKR 55,000.00</td></tr>
+        <tr><td class="lbl">Date &amp; Time</td><td>07-Nov-2026 09:40:00</td></tr>
+        <tr><td class="lbl">Available Balance</td><td>PKR 170,500.00</td></tr>
+      </table>
+      <p>HabibMetro Bank Limited</p>
+    </div>
+  </article>
+
+  <!-- 4. HabibMetro OTP Alert (Must be skipped) -->
+  <article
+    class="email-fixture"
+    data-email="true"
+    data-subject="Fwd: HabibMetro One Time Password (OTP)"
+    data-sender="user@example.com"
+    data-date="Sat, 7 Nov 2026 10:00:00 +0500"
+  >
+    <div class="outlook-hdr">
+      <p>---------- Forwarded message ---------</p>
+      <p>
+        <strong>From:</strong> Habib Metro E-Service &lt;eservice@habibmetro.com&gt;<br>
+        <strong>Sent:</strong> Saturday, November 7, 2026 10:00 AM<br>
+        <strong>Subject:</strong> HabibMetro One Time Password (OTP)
+      </p>
+    </div>
+    <div class="hmb-alert-body">
+      <p>Dear Customer,</p>
+      <p>Your One Time Password for HabibMetro Digital Banking login attempt is <strong>9355</strong>. Do not share this verification code with anyone.</p>
+    </div>
+  </article>
+
+  <!-- 5. HabibMetro Declined Alert (Must be skipped) -->
+  <article
+    class="email-fixture"
+    data-email="true"
+    data-subject="Fwd: HabibMetro Transaction Declined"
+    data-sender="user@example.com"
+    data-date="Sat, 7 Nov 2026 10:15:00 +0500"
+  >
+    <div class="outlook-hdr">
+      <p>---------- Forwarded message ---------</p>
+      <p>
+        <strong>From:</strong> Habib Metro E-Service &lt;eservice@habibmetro.com&gt;<br>
+        <strong>Sent:</strong> Saturday, November 7, 2026 10:15 AM<br>
+        <strong>Subject:</strong> HabibMetro Transaction Declined
+      </p>
+    </div>
+    <div class="hmb-alert-body">
+      <p>Dear Customer,</p>
+      <p>Your POS transaction of PKR 8,500.00 at Metro Cash &amp; Carry was declined due to insufficient funds.</p>
+    </div>
+  </article>
+
+</body>
+</html>
