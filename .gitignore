@@ -1,0 +1,28 @@
+# Secrets & Credentials
+.env
+.streamlit/secrets.toml
+credentials.json
+token.json
+
+# Databases & Backups
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+data/backups/*
+*.enc
+!data/backups/.gitkeep
+
+# Python & Virtual Environment
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# OS & Editor Artifacts
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
