@@ -1843,3 +1843,119 @@ def test_same_source_minute_alert_dedup_and_auto_link_mirrors(
     assert linked == 1
     assert db.get_wallet(WALLET_HABIBMETRO).current_balance == pytest.approx(46000.0)
     assert db.get_wallet(WALLET_NAYAPAY).current_balance == pytest.approx(5000.0)
+
+
+def test_audit_phase2_db_and_security_regressions(
+    db: DatabaseManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lock in Phase 2 audit fixes: target_account rules, no-op recurring flags, cloud calibration guard, fast helpers, secrets/tz."""
+    from datetime import timezone
+    from src.security import get_local_now, get_secret
+
+    # 1. CategoryRule.target_account persists in DB and backup/restore roundtrip
+    db.upsert_category_rule(
+        CategoryRule(
+            keyword="MCF SWEEP CUSTOM",
+            merchant_alias="MCF Sweep",
+            category="Money Market Fund",
+            cost_bucket="INVESTMENT",
+            priority=100,
+            is_user_defined=True,
+            target_account=WALLET_MMF,
+        )
+    )
+    loaded_rule = next(
+        r for r in db.get_category_rules() if r.keyword == "MCF SWEEP CUSTOM"
+    )
+    assert loaded_rule.target_account == WALLET_MMF
+    backup_json = db.export_backup_json()
+    db.restore_backup_json(backup_json)
+    restored_rule = next(
+        r for r in db.get_category_rules() if r.keyword == "MCF SWEEP CUSTOM"
+    )
+    assert restored_rule.target_account == WALLET_MMF
+
+    # 2. mark_recurring_paid no-op does not increment change_counter
+    bills = db.get_recurring_commitments()
+    bill_id = bills[0].id
+    assert bill_id is not None
+    db.mark_recurring_paid(bill_id, True, "2026-11")
+    counter_after_first = db.change_counter
+    db.mark_recurring_paid(bill_id, True, "2026-11")
+    assert db.change_counter == counter_after_first
+
+    # 3. Auto-restore must not overwrite calibrated non-zero wallets when tx count == 0
+    db.update_wallet_opening_balance(WALLET_HABIBMETRO, 75000.0)
+    restore_called = False
+
+    def _spy_restore(*args: Any, **kwargs: Any) -> tuple[bool, str]:
+        nonlocal restore_called
+        restore_called = True
+        return True, "ok"
+
+    monkeypatch.setattr(db, "restore_from_cloud_vault", _spy_restore)
+    assert db._auto_restore_from_cloud_if_empty() is False
+    assert restore_called is False
+
+    # 4. Fast SQL count/category helpers & cross-source dedup ±1d / >1h twin preservation
+    assert db.has_any_transactions() is False
+    assert db.get_needs_review_count() == 0
+
+    pdf_late = TransactionRecord(
+        message_id="PDF_LATE_NIGHT_1",
+        tx_date="2026-11-10",
+        tx_timestamp="2026-11-10 23:55:00",
+        account_name=WALLET_NAYAPAY,
+        tx_type="DEBIT",
+        amount=650.0,
+        payee="CHAI KHANA",
+        category="Food & Dining",
+        cost_bucket="VARIABLE",
+        review_status="MANUALLY_VERIFIED",
+        source="PDF_IMPORT",
+    )
+    gmail_cross_day = TransactionRecord(
+        message_id="XGM_CROSS_DAY_1",
+        tx_date="2026-11-11",
+        tx_timestamp="2026-11-11 00:05:00",
+        account_name=WALLET_NAYAPAY,
+        tx_type="DEBIT",
+        amount=650.0,
+        payee="Chai Khana",
+        category="Uncategorized",
+        cost_bucket="VARIABLE",
+        review_status="NEEDS_REVIEW",
+        source="GMAIL_NAYAPAY",
+    )
+    gmail_two_hours_later = TransactionRecord(
+        message_id="XGM_TWO_HOURS_2",
+        tx_date="2026-11-11",
+        tx_timestamp="2026-11-11 02:30:00",
+        account_name=WALLET_NAYAPAY,
+        tx_type="DEBIT",
+        amount=650.0,
+        payee="Chai Khana",
+        category="Uncategorized",
+        cost_bucket="VARIABLE",
+        review_status="NEEDS_REVIEW",
+        source="GMAIL_NAYAPAY",
+    )
+    ins_c, skip_c = db.upsert_many([pdf_late, gmail_cross_day, gmail_two_hours_later])
+    assert (ins_c, skip_c) == (2, 1)
+    assert db.has_any_transactions() is True
+    assert db.get_needs_review_count() == 1
+    assert db.get_month_transaction_counts()["2026-11"] == 2
+    assert ("Food & Dining", "VARIABLE") in db.get_distinct_categories()
+
+    # 5. Blank .env falls through to st.secrets and get_local_now() is aware PKT (+05:00)
+    import streamlit as st
+
+    monkeypatch.setenv("TEST_AUDIT_SECRET_KEY", "   ")
+    monkeypatch.setattr(st, "secrets", {"TEST_AUDIT_SECRET_KEY": "from_secrets_123"}, raising=False)
+    assert get_secret("TEST_AUDIT_SECRET_KEY") == "from_secrets_123"
+    local_now = get_local_now()
+    assert local_now.tzinfo is not None
+    assert local_now.utcoffset() == timezone(local_now.utcoffset()).utcoffset(None)
+    assert local_now.utcoffset().total_seconds() == 5 * 3600
+

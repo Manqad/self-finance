@@ -1,4 +1,4 @@
-"""Streamlit AppTest end-to-end UI regression tests across all 5 tabs."""
+"""Streamlit AppTest end-to-end UI regression tests across all 5 redesigned tabs and dialogs."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import pytest
 from streamlit.testing.v1 import AppTest
 
 from src.database.db_manager import DatabaseManager
-from src.engine.categorizer import apply_rules
+from src.engine.categorizer import apply_rules, learn_new_rule
 from src.models import (
     WALLET_CASH,
     WALLET_HABIBMETRO,
@@ -74,9 +74,6 @@ def _isolate_streamlit_db_cache(
                 _get_db_manager(p).close()
             except Exception:
                 pass
-        env_p = os.environ.get("TREASURY_DB_PATH")
-        if env_p and env_p in db_paths:
-            pass
         st.cache_resource.clear()
 
 
@@ -130,9 +127,22 @@ def _parsed(
 
 
 def _switch_tab(at: AppTest, tab_label: str) -> AppTest:
-    """Switch active tab via stateful navigation control and rerun."""
-    at.radio(key="ptos_active_tab").set_value(tab_label).run()
-    assert at.radio(key="ptos_active_tab").value == tab_label
+    """Switch active tab via native segmented_control and rerun."""
+    at.segmented_control(key="ptos_active_tab").set_value(tab_label).run()
+    assert at.segmented_control(key="ptos_active_tab").value == tab_label
+    return at
+
+
+def _open_quick_add(at: AppTest) -> AppTest:
+    """Open Top Command Bar Quick Add modal dialog."""
+    at.button(key="ptos_top_add_btn").click().run()
+    return at
+
+
+def _open_edit_tx_dialog(at: AppTest, tx_id: int) -> AppTest:
+    """Select row in Ledger and open its Edit Transaction modal dialog."""
+    at.selectbox(key="t2_selected_tx_id").set_value(tx_id).run()
+    at.button(key="t2_edit_picked_btn").click().run()
     return at
 
 
@@ -153,6 +163,7 @@ def test_empty_and_demo_db_render_all_tabs_zero_errors_or_warnings(
     DatabaseManager(empty_db).close()
 
     expected_tabs = list(ALL_TABS)
+    expected_tab_labels = [t.split(" ", 1)[-1] for t in expected_tabs]
 
     with warnings.catch_warnings(record=True) as caught_empty:
         warnings.simplefilter("always")
@@ -160,7 +171,7 @@ def test_empty_and_demo_db_render_all_tabs_zero_errors_or_warnings(
         assert list(at_empty.exception) == []
         assert list(at_empty.error) == []
         assert list(at_empty.warning) == []
-        assert at_empty.radio(key="ptos_active_tab").options == expected_tabs
+        assert at_empty.segmented_control(key="ptos_active_tab").options == expected_tab_labels
         for tab_label in expected_tabs:
             _switch_tab(at_empty, tab_label)
             assert list(at_empty.exception) == []
@@ -172,7 +183,6 @@ def test_empty_and_demo_db_render_all_tabs_zero_errors_or_warnings(
     ]
     assert src_warnings_empty == []
 
-    # Empty DB with unconfigured Gmail only renders the offline auth warning on Tab 5
     at_unconf = _create_app(monkeypatch, empty_db, configure_gmail=False)
     _switch_tab(at_unconf, TAB_SETUP)
     assert list(at_unconf.exception) == []
@@ -187,7 +197,7 @@ def test_empty_and_demo_db_render_all_tabs_zero_errors_or_warnings(
     with warnings.catch_warnings(record=True) as caught_demo:
         warnings.simplefilter("always")
         at_demo = _create_app(monkeypatch, demo_db, configure_gmail=True)
-        assert at_demo.radio(key="ptos_active_tab").options == expected_tabs
+        assert at_demo.segmented_control(key="ptos_active_tab").options == expected_tab_labels
         for tab_label in expected_tabs:
             _switch_tab(at_demo, tab_label)
             assert list(at_demo.exception) == []
@@ -203,44 +213,45 @@ def test_empty_and_demo_db_render_all_tabs_zero_errors_or_warnings(
 def test_quick_add_bucket_sync_on_category_and_type_change(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify Tab 1 Quick-Add syncs t1_qa_bucket and prevents DEBIT transfer/investment buckets."""
+    """Verify Quick-Add dialog syncs bucket and prevents DEBIT transfer/investment buckets."""
     db_path = tmp_path / "qa_sync.db"
     seed_demo_database(db_path, reference_date=date(2026, 11, 11))
     at = _create_app(monkeypatch, db_path)
+    _open_quick_add(at)
 
-    at.selectbox(key="t1_qa_type").set_value("DEBIT").run()
-    cat_opts = at.selectbox(key="t1_qa_category").options
+    at.selectbox(key="dlg_qa_type").set_value("DEBIT").run()
+    cat_opts = at.selectbox(key="dlg_qa_category").options
     assert "Money Market Fund" not in cat_opts
     assert "Internal Transfer" not in cat_opts
     assert "Salary & Income" not in cat_opts
 
-    at.selectbox(key="t1_qa_category").set_value("Bills & Utilities").run()
-    assert [opt.split(" — ")[0] for opt in at.selectbox(key="t1_qa_bucket").options] == [
+    at.selectbox(key="dlg_qa_category").set_value("Bills & Utilities").run()
+    assert [opt.split(" — ")[0] for opt in at.selectbox(key="dlg_qa_bucket").options] == [
         "FIXED",
         "VARIABLE",
         "LEAKAGE",
     ]
-    assert at.selectbox(key="t1_qa_bucket").value == "FIXED"
+    assert at.selectbox(key="dlg_qa_bucket").value == "FIXED"
 
-    at.selectbox(key="t1_qa_category").set_value("Bank & Tax Friction").run()
-    assert at.selectbox(key="t1_qa_bucket").value == "LEAKAGE"
+    at.selectbox(key="dlg_qa_category").set_value("Bank & Tax Friction").run()
+    assert at.selectbox(key="dlg_qa_bucket").value == "LEAKAGE"
 
-    at.selectbox(key="t1_qa_category").set_value("Food & Dining").run()
-    assert at.selectbox(key="t1_qa_bucket").value == "VARIABLE"
+    at.selectbox(key="dlg_qa_category").set_value("Food & Dining").run()
+    assert at.selectbox(key="dlg_qa_bucket").value == "VARIABLE"
 
-    at.selectbox(key="t1_qa_type").set_value("CREDIT").run()
-    assert [opt.split(" — ")[0] for opt in at.selectbox(key="t1_qa_bucket").options] == ["INFLOW"]
-    assert at.selectbox(key="t1_qa_bucket").value == "INFLOW"
+    at.selectbox(key="dlg_qa_type").set_value("CREDIT").run()
+    assert [opt.split(" — ")[0] for opt in at.selectbox(key="dlg_qa_bucket").options] == ["INFLOW"]
+    assert at.selectbox(key="dlg_qa_bucket").value == "INFLOW"
 
-    at.selectbox(key="t1_qa_type").set_value("DEBIT").run()
-    assert at.selectbox(key="t1_qa_bucket").value == "VARIABLE"
+    at.selectbox(key="dlg_qa_type").set_value("DEBIT").run()
+    assert at.selectbox(key="dlg_qa_bucket").value == "VARIABLE"
     assert list(at.exception) == []
 
 
 def test_quick_tag_refreshes_tab2_editor_state_without_stale_revert(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify Tab 1 Quick-Tag stays on Tab 1 and refreshes Tab 2 Editor widgets cleanly."""
+    """Verify Tab 1 Quick-Tag stays on Home and refreshes Ledger Edit Modal widgets cleanly."""
     db_path = tmp_path / "qt_refresh.db"
     mgr = DatabaseManager(db_path)
     try:
@@ -252,11 +263,8 @@ def test_quick_tag_refreshes_tab2_editor_state_without_stale_revert(
     assert tx_id is not None
 
     at = _create_app(monkeypatch, db_path)
-
-    # Confirm default memory checkbox is unchecked so single tags do not bulk-mutate unexpectedly
     assert at.checkbox(key=f"t1_qt_mem_{tx_id}").value is False
 
-    # Quick-Tag on Tab 1 (with category + alias + FIXED bucket)
     at.text_input(key=f"t1_qt_alias_{tx_id}").set_value("Zameen Utilities")
     at.selectbox(key=f"t1_qt_cat_{tx_id}").set_value("Bills & Utilities").run()
     assert at.selectbox(key=f"t1_qt_bkt_{tx_id}").value == "FIXED"
@@ -264,13 +272,13 @@ def test_quick_tag_refreshes_tab2_editor_state_without_stale_revert(
     at.button(key=f"t1_qt_save_{tx_id}").click().run()
     assert list(at.exception) == []
     assert list(at.error) == []
-    assert at.radio(key="ptos_active_tab").value == TAB_HOME
+    assert at.segmented_control(key="ptos_active_tab").value == TAB_HOME
 
-    # Switch to Tab 2 -> editor must show fresh DB state without stale defaults
     _switch_tab(at, TAB_TRANSACTIONS)
-    assert at.selectbox(key=f"t2_edit_cat_{tx_id}").value == "Bills & Utilities"
-    assert at.selectbox(key=f"t2_edit_bkt_{tx_id}").value == "FIXED"
-    assert at.text_input(key=f"t2_edit_alias_{tx_id}").value == "Zameen Utilities"
+    _open_edit_tx_dialog(at, tx_id)
+    assert at.selectbox(key=f"dlg_ed_cat_{tx_id}").value == "Bills & Utilities"
+    assert at.selectbox(key=f"dlg_ed_bkt_{tx_id}").value == "FIXED"
+    assert at.text_input(key=f"dlg_ed_alias_{tx_id}").value == "Zameen Utilities"
 
     verify_mgr = DatabaseManager(db_path)
     try:
@@ -286,7 +294,7 @@ def test_quick_tag_refreshes_tab2_editor_state_without_stale_revert(
 def test_tab3_category_limit_sync_casing_normalization_and_popover_deletes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify Tab 3 stays on Tab 3 across limit updates, category add, bill delete, and Tab 2 delete."""
+    """Verify Category edit/add casing normalization, bill delete, and transaction 2-step delete."""
     db_path = tmp_path / "tab3_ops.db"
     seed_demo_database(db_path, reference_date=date(2026, 11, 11))
 
@@ -305,39 +313,41 @@ def test_tab3_category_limit_sync_casing_normalization_and_popover_deletes(
     at = _create_app(monkeypatch, db_path)
     _switch_tab(at, TAB_BUDGETS)
 
-    # 1. Update Groceries cap and submit -> stays on Tab 3 and keeps 30000.0
-    lim_key = f"t3_cat_limit_{groceries.id}_Groceries"
-    at.number_input(key=lim_key).set_value(30000.0)
-    _find_form_button(at, "💾 Save Category Limits").click().run()
+    # 1. Update Groceries cap via Edit Category modal -> stays on Budgets
+    at.selectbox(key="t3_cat_pick_id").set_value(groceries.id).run()
+    at.button(key="t3_open_edit_cat_btn").click().run()
+    at.number_input(key=f"dlg_ec_limit_{groceries.id}").set_value(30000.0)
+    at.button(key=f"dlg_ec_save_{groceries.id}").click().run()
     assert list(at.exception) == []
-    assert at.radio(key="ptos_active_tab").value == TAB_BUDGETS
-    assert at.number_input(key=lim_key).value == pytest.approx(30000.0)
+    assert at.segmented_control(key="ptos_active_tab").value == TAB_BUDGETS
 
-    # 2. Add custom category with extra spaces, then update using mismatched case -> single canonical category
-    at.text_input(key="t3_nc_name").set_value("  Fitness  &  Gym ")
-    at.number_input(key="t3_nc_limit").set_value(6000.0)
-    at.button(key="t3_nc_submit").click().run()
+    # 2. Add custom category with extra spaces, then upsert with mismatched case -> single canonical row
+    at.button(key="t3_open_new_cat_btn").click().run()
+    at.text_input(key="dlg_nc_name").set_value("  Fitness  &  Gym ")
+    at.number_input(key="dlg_nc_limit").set_value(6000.0)
+    at.button(key="dlg_nc_save").click().run()
     assert list(at.exception) == []
-    assert at.radio(key="ptos_active_tab").value == TAB_BUDGETS
 
-    at.text_input(key="t3_nc_name").set_value("  fitness &   gym ")
-    at.number_input(key="t3_nc_limit").set_value(7500.0)
-    at.button(key="t3_nc_submit").click().run()
+    at.button(key="t3_open_new_cat_btn").click().run()
+    at.text_input(key="dlg_nc_name").set_value("  fitness &   gym ")
+    at.number_input(key="dlg_nc_limit").set_value(7500.0)
+    at.button(key="dlg_nc_save").click().run()
     assert list(at.exception) == []
-    assert at.radio(key="ptos_active_tab").value == TAB_BUDGETS
+    assert at.segmented_control(key="ptos_active_tab").value == TAB_BUDGETS
 
-    # 3. Recurring commitment popover delete confirmation -> stays on Tab 3
+    # 3. Recurring commitment popover delete confirmation -> stays on Budgets
     at.button(key=f"t3_bill_del_{target_bill_id}").click().run()
     assert list(at.exception) == []
-    assert at.radio(key="ptos_active_tab").value == TAB_BUDGETS
+    assert at.segmented_control(key="ptos_active_tab").value == TAB_BUDGETS
 
-    # 4. Transaction Editor popover delete confirmation on Tab 2 -> stays on Tab 2
+    # 4. Transaction 2-step delete inside Edit Modal on Ledger tab -> stays on Ledger
     _switch_tab(at, TAB_TRANSACTIONS)
-    at.selectbox(key="t2_selected_tx_id").set_value(target_tx_id).run()
-    at.button(key=f"t2_btn_del_{target_tx_id}").click().run()
+    _open_edit_tx_dialog(at, target_tx_id)
+    at.button(key=f"dlg_ed_del_arm_{target_tx_id}").click().run()
+    at.button(key=f"dlg_ed_del_go_{target_tx_id}").click().run()
     assert list(at.exception) == []
     assert list(at.error) == []
-    assert at.radio(key="ptos_active_tab").value == TAB_TRANSACTIONS
+    assert at.segmented_control(key="ptos_active_tab").value == TAB_TRANSACTIONS
 
     verify_mgr = DatabaseManager(db_path)
     try:
@@ -366,20 +376,14 @@ def test_tab3_category_limit_sync_casing_normalization_and_popover_deletes(
 def test_month_switching_refreshes_quick_add_and_tab2_custom_date_bounds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify switching ptos_active_month refreshes month-keyed Quick-Add and Tab 2 custom date bounds."""
+    """Verify switching ptos_active_month refreshes Quick-Add date & Ledger custom date bounds."""
     db_path = tmp_path / "month_switch.db"
     mgr = DatabaseManager(db_path)
     try:
         mgr.upsert_many(
             [
-                apply_rules(
-                    _parsed("MS_OCT", "IMTIAZ", 8000.0, tx_date="2026-10-12"),
-                    mgr,
-                ),
-                apply_rules(
-                    _parsed("MS_NOV", "FOODPANDA", 1500.0, tx_date="2026-11-09"),
-                    mgr,
-                ),
+                apply_rules(_parsed("MS_OCT", "IMTIAZ", 8000.0, tx_date="2026-10-12"), mgr),
+                apply_rules(_parsed("MS_NOV", "FOODPANDA", 1500.0, tx_date="2026-11-09"), mgr),
             ]
         )
     finally:
@@ -387,13 +391,16 @@ def test_month_switching_refreshes_quick_add_and_tab2_custom_date_bounds(
 
     at = _create_app(monkeypatch, db_path)
     at.selectbox(key="ptos_active_month").set_value("2026-11").run()
-    qa_nov = at.date_input(key="t1_qa_date_2026-11").value
+    _open_quick_add(at)
+    qa_nov = at.date_input(key="dlg_qa_date").value
     assert qa_nov.year == 2026 and qa_nov.month == 11
+    at.button(key="dlg_qa_cancel").click().run()
 
     at.selectbox(key="ptos_active_month").set_value("2026-10").run()
-    assert list(at.exception) == []
-    qa_oct = at.date_input(key="t1_qa_date_2026-10").value
+    _open_quick_add(at)
+    qa_oct = at.date_input(key="dlg_qa_date").value
     assert qa_oct.year == 2026 and qa_oct.month == 10
+    at.button(key="dlg_qa_cancel").click().run()
 
     _switch_tab(at, TAB_TRANSACTIONS)
     at.selectbox(key="t2_period_mode").set_value("custom").run()
@@ -402,7 +409,7 @@ def test_month_switching_refreshes_quick_add_and_tab2_custom_date_bounds(
 
     at.selectbox(key="ptos_active_month").set_value("2026-11").run()
     assert list(at.exception) == []
-    assert at.radio(key="ptos_active_tab").value == TAB_TRANSACTIONS
+    assert at.segmented_control(key="ptos_active_tab").value == TAB_TRANSACTIONS
     assert at.date_input(key="t2_d_start_2026-11").value == date(2026, 11, 1)
     assert at.date_input(key="t2_d_end_2026-11").value == date(2026, 11, 30)
 
@@ -489,7 +496,7 @@ def test_zero_cap_hero_gauge_renders_no_cap_set_not_on_track_zero(
 def test_tab5_partial_import_errors_survive_rerun(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify Tab 5 stays on Tab 5, preserves import errors across rerun, and resets uploader."""
+    """Verify Tab 5 stays on Setup, preserves import errors across rerun, and resets uploader."""
     db_path = tmp_path / "tab5_import.db"
     DatabaseManager(db_path).close()
 
@@ -511,14 +518,12 @@ def test_tab5_partial_import_errors_survive_rerun(
     at.button(key="t5_import_btn").click().run()
 
     assert list(at.exception) == []
-    assert at.radio(key="ptos_active_tab").value == TAB_SETUP
+    assert at.segmented_control(key="ptos_active_tab").value == TAB_SETUP
     errors = [e.value for e in at.error]
     successes = [s.value for s in at.success]
     assert len(errors) == 1
     assert "broken_stmt.pdf" in errors[0]
     assert any("Statement Import" in s and "1 new" in s for s in successes)
-
-    # Uploader key incremented so stale file list cleared cleanly
     assert any(
         str(u.key) == "t5_statement_files_1" for u in at.get("file_uploader")
     )
@@ -536,7 +541,7 @@ def test_tab5_partial_import_errors_survive_rerun(
 def test_tab5_live_balance_calibration_prevents_double_deduction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Submitting Tab 5 Live Balance mode calibrates anchor timestamp and keeps user on Tab 5."""
+    """Submitting Live Balance form calibrates anchor timestamp without historical double-deduction."""
     db_path = tmp_path / "tab5_live_cal.db"
     mgr = DatabaseManager(db_path)
     try:
@@ -567,7 +572,7 @@ def test_tab5_live_balance_calibration_prevents_double_deduction(
     at.number_input(key="t5_cur_bal_NayaPay").set_value(10000.0)
     at.button(key="t5_save_live_bal_btn").click().run()
     assert list(at.exception) == []
-    assert at.radio(key="ptos_active_tab").value == TAB_SETUP
+    assert at.segmented_control(key="ptos_active_tab").value == TAB_SETUP
 
     verify_mgr = DatabaseManager(db_path)
     try:
@@ -576,8 +581,7 @@ def test_tab5_live_balance_calibration_prevents_double_deduction(
         assert w_after.current_balance == pytest.approx(10000.0)
         assert w_after.opening_balance == pytest.approx(10000.0)
         assert w_after.balance_as_of is not None
-        all_wallets = verify_mgr.get_wallets()
-        assert all(w.balance_as_of == w_after.balance_as_of for w in all_wallets)
+        assert all(w.balance_as_of == w_after.balance_as_of for w in verify_mgr.get_wallets())
 
         old_csv = (
             "Date,Description,Debit,Credit,Balance\n"
@@ -591,7 +595,7 @@ def test_tab5_live_balance_calibration_prevents_double_deduction(
         uploader.upload("nayapay_past.csv", old_csv, "text/csv")
         at2.button(key="t5_import_btn").click().run()
         assert list(at2.exception) == []
-        assert at2.radio(key="ptos_active_tab").value == TAB_SETUP
+        assert at2.segmented_control(key="ptos_active_tab").value == TAB_SETUP
     finally:
         verify_mgr.close()
 
@@ -608,7 +612,7 @@ def test_tab5_live_balance_calibration_prevents_double_deduction(
 def test_tab2_save_only_isolation_and_rule_keyword_validation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify Tab 2 Save Only mutates strictly 1 row and Rule validation fails before DB commit."""
+    """Verify Save Only mutates strictly 1 row and Rule validation fails before DB commit."""
     db_path = tmp_path / "tab2_isolation.db"
     mgr = DatabaseManager(db_path)
     try:
@@ -638,16 +642,15 @@ def test_tab2_save_only_isolation_and_rule_keyword_validation(
     assert tx1_id is not None and tx2_id is not None
 
     at = _create_app(monkeypatch, db_path)
-    # Test Tab 1 quick jump into Tab 2 Review Queue
-    at.button(key="t1_go_review").click().run()
-    assert at.radio(key="ptos_active_tab").value == TAB_TRANSACTIONS
-    assert at.checkbox(key="t2_needs_review_only").value is True
+    at.button(key="t1_go_review_btn").click().run()
+    assert at.segmented_control(key="ptos_active_tab").value == TAB_TRANSACTIONS
+    assert at.pills(key="t2_quick_pill").value == "Needs Review"
 
-    # 1. Attempting Save & Apply Rule with <3 char keyword must fail cleanly without touching DB
-    at.selectbox(key="t2_selected_tx_id").set_value(tx1_id).run()
-    at.selectbox(key=f"t2_edit_cat_{tx1_id}").set_value("Food & Dining").run()
-    at.text_input(key=f"t2_edit_kw_{tx1_id}").set_value("KE")
-    at.button(key=f"t2_btn_learn_{tx1_id}").click().run()
+    # 1. Edit modal rule keyword <3 chars fails cleanly without mutating DB
+    _open_edit_tx_dialog(at, tx1_id)
+    at.selectbox(key=f"dlg_ed_cat_{tx1_id}").set_value("Food & Dining").run()
+    at.text_input(key=f"dlg_ed_kw_{tx1_id}").set_value("KE")
+    at.button(key=f"dlg_ed_save_rule_{tx1_id}").click().run()
     assert list(at.exception) == []
     assert any("at least 3 characters" in e.value for e in at.error)
 
@@ -659,11 +662,11 @@ def test_tab2_save_only_isolation_and_rule_keyword_validation(
     finally:
         mgr_chk1.close()
 
-    # 2. Save Only This Transaction must mutate ONLY tx1_id and leave tx2_id untouched
-    at.button(key=f"t2_btn_save_{tx1_id}").click().run()
+    # 2. Save Only mutates strictly tx1_id and leaves tx2_id untouched
+    at.button(key=f"dlg_ed_save_only_{tx1_id}").click().run()
     assert list(at.exception) == []
     assert list(at.error) == []
-    assert at.radio(key="ptos_active_tab").value == TAB_TRANSACTIONS
+    assert at.segmented_control(key="ptos_active_tab").value == TAB_TRANSACTIONS
 
     mgr_chk2 = DatabaseManager(db_path)
     try:
@@ -676,7 +679,7 @@ def test_tab2_save_only_isolation_and_rule_keyword_validation(
         mgr_chk2.close()
 
     # 3. Wallet filter for Money Market Fund includes incoming TRANSFER_MMF rows
-    at.checkbox(key="t2_needs_review_only").uncheck().run()
+    at.pills(key="t2_quick_pill").set_value("All").run()
     at.selectbox(key="t2_wallet").set_value(WALLET_MMF).run()
     mmf_rows = [m for m in at.metric if m.label == "Matching Rows"]
     assert mmf_rows and mmf_rows[0].value == "1"
@@ -685,7 +688,7 @@ def test_tab2_save_only_isolation_and_rule_keyword_validation(
 def test_tab3_bill_pay_anchors_live_balance_and_tab5_cross_card_isolation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify Tab 3 Log Payment adjusts anchored live balance and Tab 5 cards stay mutually isolated."""
+    """Verify Bill Pay modal anchors live balance and Tab 5 form cards stay mutually isolated."""
     db_path = tmp_path / "tab3_tab5_iso.db"
     today_month = date.today().strftime("%Y-%m")
     mgr = DatabaseManager(db_path)
@@ -709,21 +712,22 @@ def test_tab3_bill_pay_anchors_live_balance_and_tab5_cross_card_isolation(
     at = _create_app(monkeypatch, db_path)
     at.selectbox(key="ptos_active_month").set_value(today_month).run()
     _switch_tab(at, TAB_BUDGETS)
-    at.selectbox(key="t3_bill_pay_wallet").set_value(WALLET_NAYAPAY).run()
     at.button(key=f"t3_bill_pay_{bill.id}").click().run()
+    at.selectbox(key=f"dlg_pb_wallet_{bill.id}").set_value(WALLET_NAYAPAY).run()
+    at.button(key=f"dlg_pb_save_{bill.id}").click().run()
     assert list(at.exception) == []
-    assert at.radio(key="ptos_active_tab").value == TAB_BUDGETS
+    assert at.segmented_control(key="ptos_active_tab").value == TAB_BUDGETS
 
-    # Switch to Tab 5 -> NayaPay current balance input must reflect updated 7800.0 (not stale 10000.0)
+    # Setup balance input must reflect updated 7800.0
     _switch_tab(at, TAB_SETUP)
     assert at.number_input(key="t5_cur_bal_NayaPay").value == pytest.approx(7800.0)
 
-    # Edit Defense Config WITHOUT saving, then save Live Balances -> Defense Config edit survives and does NOT commit prematurely
+    # Edit Defense form WITHOUT saving, then submit Live Balances form -> Defense edit survives uncommitted
     at.number_input(key="t5_cfg_income").set_value(320000.0)
     at.number_input(key="t5_cur_bal_Cash_in_Hand").set_value(12500.0)
     at.button(key="t5_save_live_bal_btn").click().run()
     assert list(at.exception) == []
-    assert at.radio(key="ptos_active_tab").value == TAB_SETUP
+    assert at.segmented_control(key="ptos_active_tab").value == TAB_SETUP
     assert at.number_input(key="t5_cfg_income").value == pytest.approx(320000.0)
 
     verify_mgr = DatabaseManager(db_path)
@@ -741,7 +745,7 @@ def test_tab3_bill_pay_anchors_live_balance_and_tab5_cross_card_isolation(
 def test_tab1_quick_tag_short_keyword_guard_and_quick_add_tab_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify Tab 1 Quick-Tag rejects <3 char keyword safely and Quick-Add stays on Tab 1."""
+    """Verify Quick-Tag rejects <3 char keyword safely and Quick-Add modal saves and closes cleanly."""
     db_path = tmp_path / "tab1_guards.db"
     mgr = DatabaseManager(db_path)
     try:
@@ -767,22 +771,21 @@ def test_tab1_quick_tag_short_keyword_guard_and_quick_add_tab_lock(
     finally:
         verify_mgr.close()
 
-    # Quick-Add clean submit stays on Tab 1 and resets category back to Auto-Categorize
-    at.selectbox(key="t1_qa_type").set_value("DEBIT").run()
-    at.selectbox(key="t1_qa_category").set_value("Groceries").run()
-    at.number_input(key="t1_qa_amount").set_value(1200.0)
-    at.text_input(key="t1_qa_payee").set_value("Fresh Fruit Cart")
-    at.button(key="t1_qa_submit").click().run()
+    _open_quick_add(at)
+    at.selectbox(key="dlg_qa_type").set_value("DEBIT").run()
+    at.selectbox(key="dlg_qa_category").set_value("Groceries").run()
+    at.number_input(key="dlg_qa_amount").set_value(1200.0)
+    at.text_input(key="dlg_qa_payee").set_value("Fresh Fruit Cart")
+    at.button(key="dlg_qa_submit").click().run()
     assert list(at.exception) == []
     assert list(at.error) == []
-    assert at.radio(key="ptos_active_tab").value == TAB_HOME
-    assert at.selectbox(key="t1_qa_category").value == "Auto-Categorize (Rules)"
+    assert at.segmented_control(key="ptos_active_tab").value == TAB_HOME
 
 
 def test_tab5_defense_config_reverse_isolation_and_opening_balance_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify Defense Config save preserves unsaved balance edits and Historical Opening mode clears anchors."""
+    """Verify Defense Config form save preserves unsaved balance edits and Opening mode clears anchors."""
     db_path = tmp_path / "tab5_defense_open.db"
     mgr = DatabaseManager(db_path)
     try:
@@ -809,7 +812,6 @@ def test_tab5_defense_config_reverse_isolation_and_opening_balance_mode(
     at = _create_app(monkeypatch, db_path)
     _switch_tab(at, TAB_SETUP)
 
-    # Leave an unsaved live balance edit in sibling card before saving Defense Config
     at.number_input(key="t5_cur_bal_Cash_in_Hand").set_value(9999.0)
     at.number_input(key="t5_cfg_income").set_value(350000.0)
     at.number_input(key="t5_cfg_fixed").set_value(90000.0)
@@ -820,7 +822,7 @@ def test_tab5_defense_config_reverse_isolation_and_opening_balance_mode(
 
     assert list(at.exception) == []
     assert list(at.error) == []
-    assert at.radio(key="ptos_active_tab").value == TAB_SETUP
+    assert at.segmented_control(key="ptos_active_tab").value == TAB_SETUP
     assert at.number_input(key="t5_cur_bal_Cash_in_Hand").value == pytest.approx(9999.0)
 
     mgr_chk1 = DatabaseManager(db_path)
@@ -838,7 +840,6 @@ def test_tab5_defense_config_reverse_isolation_and_opening_balance_mode(
     finally:
         mgr_chk1.close()
 
-    # Switch to Historical Opening Balance mode and save
     at.radio(key="t5_wallet_balance_mode").set_value(
         "Set Historical Opening Balance (Before Tracked Txns)"
     ).run()
@@ -847,7 +848,7 @@ def test_tab5_defense_config_reverse_isolation_and_opening_balance_mode(
 
     assert list(at.exception) == []
     assert list(at.error) == []
-    assert at.radio(key="ptos_active_tab").value == TAB_SETUP
+    assert at.segmented_control(key="ptos_active_tab").value == TAB_SETUP
 
     mgr_chk2 = DatabaseManager(db_path)
     try:
@@ -863,7 +864,7 @@ def test_tab5_defense_config_reverse_isolation_and_opening_balance_mode(
 def test_rule_learning_happy_paths_and_quick_add_transfers_and_nav(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify >=3-char rule learning on Tab 1/Tab 2, Quick-Add transfer types & errors, and Tab 1 nav shortcuts."""
+    """Verify >=3-char rule learning on Home/Ledger, Quick-Add transfer types & errors, and nav shortcuts."""
     db_path = tmp_path / "rules_qa_nav.db"
     mgr = DatabaseManager(db_path)
     try:
@@ -885,7 +886,7 @@ def test_rule_learning_happy_paths_and_quick_add_transfers_and_nav(
 
     at = _create_app(monkeypatch, db_path)
 
-    # 1. Tab 1 Quick-Tag learn rule happy path updates rule + sibling row
+    # 1. Home Quick-Tag learn rule happy path
     at.selectbox(key=f"t1_qt_cat_{qt1_id}").set_value("Food & Dining").run()
     at.text_input(key=f"t1_qt_alias_{qt1_id}").set_value("Xyzzy Food")
     at.text_input(key=f"t1_qt_kw_{qt1_id}").set_value("XYZZY BAZAAR")
@@ -893,18 +894,18 @@ def test_rule_learning_happy_paths_and_quick_add_transfers_and_nav(
     at.button(key=f"t1_qt_save_{qt1_id}").click().run()
     assert list(at.exception) == []
     assert list(at.error) == []
-    assert at.radio(key="ptos_active_tab").value == TAB_HOME
+    assert at.segmented_control(key="ptos_active_tab").value == TAB_HOME
 
-    # 2. Tab 2 Learn Rule happy path updates rule + sibling QWEVOK TRADERS row
-    at.button(key="t1_go_review").click().run()
-    assert at.radio(key="ptos_active_tab").value == TAB_TRANSACTIONS
-    at.selectbox(key="t2_selected_tx_id").set_value(t2_id).run()
-    at.selectbox(key=f"t2_edit_cat_{t2_id}").set_value("Shopping").run()
-    at.text_input(key=f"t2_edit_kw_{t2_id}").set_value("QWEVOK TRADERS")
-    at.button(key=f"t2_btn_learn_{t2_id}").click().run()
+    # 2. Ledger Edit Modal Learn Rule happy path updates sibling QWEVOK TRADERS row
+    at.button(key="t1_go_review_btn").click().run()
+    assert at.segmented_control(key="ptos_active_tab").value == TAB_TRANSACTIONS
+    _open_edit_tx_dialog(at, t2_id)
+    at.selectbox(key=f"dlg_ed_cat_{t2_id}").set_value("Shopping").run()
+    at.text_input(key=f"dlg_ed_kw_{t2_id}").set_value("QWEVOK TRADERS")
+    at.button(key=f"dlg_ed_save_rule_{t2_id}").click().run()
     assert list(at.exception) == []
     assert list(at.error) == []
-    assert at.radio(key="ptos_active_tab").value == TAB_TRANSACTIONS
+    assert at.segmented_control(key="ptos_active_tab").value == TAB_TRANSACTIONS
 
     mgr_rules = DatabaseManager(db_path)
     try:
@@ -920,51 +921,55 @@ def test_rule_learning_happy_paths_and_quick_add_transfers_and_nav(
     finally:
         mgr_rules.close()
 
-    # 3. Quick-Add validation errors (amount <= 0, blank payee) + DEBIT auto-categorize + CREDIT + transfers
+    # 3. Quick-Add modal validation & happy paths
     _switch_tab(at, TAB_HOME)
-    at.number_input(key="t1_qa_amount").set_value(0.0)
-    at.button(key="t1_qa_submit").click().run()
+    _open_quick_add(at)
+    at.number_input(key="dlg_qa_amount").set_value(0.0)
+    at.button(key="dlg_qa_submit").click().run()
     assert any("greater than Rs. 0" in e.value for e in at.error)
 
-    at.number_input(key="t1_qa_amount").set_value(500.0)
-    at.text_input(key="t1_qa_payee").set_value("")
-    at.button(key="t1_qa_submit").click().run()
+    at.number_input(key="dlg_qa_amount").set_value(500.0)
+    at.text_input(key="dlg_qa_payee").set_value("")
+    at.button(key="dlg_qa_submit").click().run()
     assert any("Payee" in e.value for e in at.error)
 
-    # Auto-Categorize matches learned XYZZY BAZAAR rule
-    at.selectbox(key="t1_qa_account").set_value(WALLET_HABIBMETRO).run()
-    at.selectbox(key="t1_qa_type").set_value("DEBIT").run()
-    at.selectbox(key="t1_qa_category").set_value("Auto-Categorize (Rules)").run()
-    at.number_input(key="t1_qa_amount").set_value(500.0)
-    at.text_input(key="t1_qa_payee").set_value("XYZZY BAZAAR DHA")
-    at.button(key="t1_qa_submit").click().run()
+    # Auto-Categorize DEBIT
+    at.selectbox(key="dlg_qa_wallet").set_value(WALLET_HABIBMETRO).run()
+    at.selectbox(key="dlg_qa_type").set_value("DEBIT").run()
+    at.selectbox(key="dlg_qa_category").set_value("Auto-Categorize (Rules)").run()
+    at.number_input(key="dlg_qa_amount").set_value(500.0)
+    at.text_input(key="dlg_qa_payee").set_value("XYZZY BAZAAR DHA")
+    at.button(key="dlg_qa_submit").click().run()
     assert list(at.error) == []
 
     # CREDIT
-    at.selectbox(key="t1_qa_account").set_value(WALLET_HABIBMETRO).run()
-    at.selectbox(key="t1_qa_type").set_value("CREDIT").run()
-    at.number_input(key="t1_qa_amount").set_value(50000.0)
-    at.text_input(key="t1_qa_payee").set_value("Freelance Client")
-    at.button(key="t1_qa_submit").click().run()
+    _open_quick_add(at)
+    at.selectbox(key="dlg_qa_wallet").set_value(WALLET_HABIBMETRO).run()
+    at.selectbox(key="dlg_qa_type").set_value("CREDIT").run()
+    at.number_input(key="dlg_qa_amount").set_value(50000.0)
+    at.text_input(key="dlg_qa_payee").set_value("Freelance Client")
+    at.button(key="dlg_qa_submit").click().run()
     assert list(at.error) == []
 
     # TRANSFER_INTERNAL -> NayaPay
-    at.selectbox(key="t1_qa_account").set_value(WALLET_HABIBMETRO).run()
-    at.selectbox(key="t1_qa_type").set_value("TRANSFER_INTERNAL").run()
-    at.selectbox(key="t1_qa_target").set_value(WALLET_NAYAPAY).run()
-    at.number_input(key="t1_qa_amount").set_value(4000.0)
-    at.text_input(key="t1_qa_payee").set_value("Top Up NayaPay")
-    at.button(key="t1_qa_submit").click().run()
+    _open_quick_add(at)
+    at.selectbox(key="dlg_qa_wallet").set_value(WALLET_HABIBMETRO).run()
+    at.selectbox(key="dlg_qa_type").set_value("TRANSFER_INTERNAL").run()
+    at.selectbox(key="dlg_qa_target").set_value(WALLET_NAYAPAY).run()
+    at.number_input(key="dlg_qa_amount").set_value(4000.0)
+    at.text_input(key="dlg_qa_payee").set_value("Top Up NayaPay")
+    at.button(key="dlg_qa_submit").click().run()
     assert list(at.error) == []
 
     # TRANSFER_MMF -> Money Market Fund
-    at.selectbox(key="t1_qa_account").set_value(WALLET_HABIBMETRO).run()
-    at.selectbox(key="t1_qa_type").set_value("TRANSFER_MMF").run()
-    at.number_input(key="t1_qa_amount").set_value(6000.0)
-    at.text_input(key="t1_qa_payee").set_value("Al Meezan Sweep")
-    at.button(key="t1_qa_submit").click().run()
+    _open_quick_add(at)
+    at.selectbox(key="dlg_qa_wallet").set_value(WALLET_HABIBMETRO).run()
+    at.selectbox(key="dlg_qa_type").set_value("TRANSFER_MMF").run()
+    at.number_input(key="dlg_qa_amount").set_value(6000.0)
+    at.text_input(key="dlg_qa_payee").set_value("Al Meezan Sweep")
+    at.button(key="dlg_qa_submit").click().run()
     assert list(at.error) == []
-    assert at.radio(key="ptos_active_tab").value == TAB_HOME
+    assert at.segmented_control(key="ptos_active_tab").value == TAB_HOME
 
     mgr_bal = DatabaseManager(db_path)
     try:
@@ -980,18 +985,18 @@ def test_rule_learning_happy_paths_and_quick_add_transfers_and_nav(
     finally:
         mgr_bal.close()
 
-    # 4. Tab 1 quick-nav shortcuts to Tab 3 and Tab 2
+    # 4. Home nav shortcuts
     at.button(key="t1_go_budgets").click().run()
-    assert at.radio(key="ptos_active_tab").value == TAB_BUDGETS
+    assert at.segmented_control(key="ptos_active_tab").value == TAB_BUDGETS
     _switch_tab(at, TAB_HOME)
     at.button(key="t1_go_ledger").click().run()
-    assert at.radio(key="ptos_active_tab").value == TAB_TRANSACTIONS
+    assert at.segmented_control(key="ptos_active_tab").value == TAB_TRANSACTIONS
 
 
 def test_tab3_recurring_lifecycle_bill_note_matching_and_tab2_filters(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify Tab 3 add/pay([bill:id])/pause/resume/delete/archive/restore and Tab 2 full filter suite."""
+    """Verify recurring bill modal add/pay/pause/resume/delete, category archive/restore, and Ledger filters."""
     db_path = tmp_path / "tab3_lifecycle_tab2_filters.db"
     today_month = date.today().strftime("%Y-%m")
     mgr = DatabaseManager(db_path)
@@ -1031,19 +1036,19 @@ def test_tab3_recurring_lifecycle_bill_note_matching_and_tab2_filters(
     at.selectbox(key="ptos_active_month").set_value(today_month).run()
     _switch_tab(at, TAB_BUDGETS)
 
-    # 1. Recurring form validation + valid creation with non-matching keyword (tests [bill:{id}] matching)
-    at.text_input(key="t3_rc_title").set_value("")
-    at.button(key="t3_rc_submit").click().run()
+    # 1. Recurring modal validation + creation
+    at.button(key="t3_open_new_bill_btn").click().run()
+    at.text_input(key="dlg_eb_title_None").set_value("")
+    at.button(key="dlg_eb_save_None").click().run()
     assert any("required" in e.value.lower() for e in at.error)
 
-    at.text_input(key="t3_rc_title").set_value("Internet Plan")
-    at.text_input(key="t3_rc_keyword").set_value("UNRELATED_TOKEN_XYZ")
-    at.number_input(key="t3_rc_amount").set_value(3500.0)
-    at.number_input(key="t3_rc_due_day").set_value(10)
-    at.button(key="t3_rc_submit").click().run()
+    at.text_input(key="dlg_eb_title_None").set_value("Internet Plan")
+    at.text_input(key="dlg_eb_kw_None").set_value("UNRELATED_TOKEN_XYZ")
+    at.number_input(key="dlg_eb_amt_None").set_value(3500.0)
+    at.number_input(key="dlg_eb_day_None").set_value(10)
+    at.button(key="dlg_eb_save_None").click().run()
     assert list(at.error) == []
-    assert at.radio(key="ptos_active_tab").value == TAB_BUDGETS
-    assert at.text_input(key="t3_rc_title").value == ""
+    assert at.segmented_control(key="ptos_active_tab").value == TAB_BUDGETS
 
     mgr_b = DatabaseManager(db_path)
     try:
@@ -1053,31 +1058,33 @@ def test_tab3_recurring_lifecycle_bill_note_matching_and_tab2_filters(
         mgr_b.close()
     assert bill_id is not None
 
-    # 2. Log Payment stamps [bill:{bill_id}] and drops Unpaid Remaining by 3500 + flips to Matched in ledger
-    unpaid_before_str = [m for m in at.metric if m.label == "Unpaid Remaining"][0].value
+    # 2. Pay modal stamps [bill:{bill_id}] and lowers Unpaid Bills by 3500
+    unpaid_before_str = [m for m in at.metric if m.label == "Unpaid Bills"][0].value
     unpaid_before = float(unpaid_before_str.replace("Rs.", "").replace(",", "").strip())
     at.button(key=f"t3_bill_pay_{bill_id}").click().run()
+    at.button(key=f"dlg_pb_save_{bill_id}").click().run()
     assert list(at.error) == []
-    assert at.radio(key="ptos_active_tab").value == TAB_BUDGETS
-    unpaid_after_str = [m for m in at.metric if m.label == "Unpaid Remaining"][0].value
+    unpaid_after_str = [m for m in at.metric if m.label == "Unpaid Bills"][0].value
     unpaid_after = float(unpaid_after_str.replace("Rs.", "").replace(",", "").strip())
     assert unpaid_before - unpaid_after == pytest.approx(3500.0)
-    assert any("Matched in ledger" in c.value for c in at.caption)
 
     # 3. Pause -> Resume -> Pause -> Delete paused bill
     at.button(key=f"t3_bill_pause_{bill_id}").click().run()
-    assert at.radio(key="ptos_active_tab").value == TAB_BUDGETS
     at.button(key=f"t3_bill_resume_{bill_id}").click().run()
-    assert at.radio(key="ptos_active_tab").value == TAB_BUDGETS
     at.button(key=f"t3_bill_pause_{bill_id}").click().run()
     at.button(key=f"t3_bill_pdel_{bill_id}").click().run()
-    assert at.radio(key="ptos_active_tab").value == TAB_BUDGETS
+    assert at.segmented_control(key="ptos_active_tab").value == TAB_BUDGETS
 
-    # 4. Archive -> Restore category budget
-    at.button(key=f"t3_cat_archive_{cb.id}").click().run()
-    assert at.radio(key="ptos_active_tab").value == TAB_BUDGETS
-    at.button(key=f"t3_cat_restore_{cb.id}").click().run()
-    assert at.radio(key="ptos_active_tab").value == TAB_BUDGETS
+    # 4. Archive -> Restore category budget via Edit Category modal
+    at.selectbox(key="t3_cat_pick_id").set_value(cb.id).run()
+    at.button(key="t3_open_edit_cat_btn").click().run()
+    at.checkbox(key=f"dlg_ec_active_{cb.id}").uncheck()
+    at.button(key=f"dlg_ec_save_{cb.id}").click().run()
+
+    at.selectbox(key="t3_cat_pick_id").set_value(cb.id).run()
+    at.button(key="t3_open_edit_cat_btn").click().run()
+    at.checkbox(key=f"dlg_ec_active_{cb.id}").check()
+    at.button(key=f"dlg_ec_save_{cb.id}").click().run()
 
     mgr_fin = DatabaseManager(db_path)
     try:
@@ -1090,7 +1097,7 @@ def test_tab3_recurring_lifecycle_bill_note_matching_and_tab2_filters(
     finally:
         mgr_fin.close()
 
-    # 5. Tab 2 filters: search, category, bucket, all_months, custom swapped dates
+    # 5. Ledger filters: search, category, bucket, all_months, custom swapped dates
     _switch_tab(at, TAB_TRANSACTIONS)
     at.selectbox(key="t2_period_mode").set_value("all_months").run()
     at.text_input(key="t2_search").set_value("LEGACY").run()
@@ -1100,7 +1107,7 @@ def test_tab3_recurring_lifecycle_bill_note_matching_and_tab2_filters(
     at.text_input(key="t2_search").set_value("").run()
     at.selectbox(key="t2_category").set_value("Dining & Coffee").run()
     at.selectbox(key="t2_bucket").set_value("VARIABLE").run()
-    assert at.radio(key="ptos_active_tab").value == TAB_TRANSACTIONS
+    assert at.segmented_control(key="ptos_active_tab").value == TAB_TRANSACTIONS
 
     at.selectbox(key="t2_category").set_value("All Categories").run()
     at.selectbox(key="t2_bucket").set_value("All Buckets").run()
@@ -1108,7 +1115,7 @@ def test_tab3_recurring_lifecycle_bill_note_matching_and_tab2_filters(
     at.date_input(key=f"t2_d_start_{today_month}").set_value(date(2026, 12, 20))
     at.date_input(key=f"t2_d_end_{today_month}").set_value(date(2026, 12, 1)).run()
     assert any("swapping bounds" in w.value for w in at.warning)
-    assert at.radio(key="ptos_active_tab").value == TAB_TRANSACTIONS
+    assert at.segmented_control(key="ptos_active_tab").value == TAB_TRANSACTIONS
 
 
 def test_tab5_gmail_sync_fixtures_and_backups(
@@ -1141,23 +1148,20 @@ def test_tab5_gmail_sync_fixtures_and_backups(
     at = _create_app(monkeypatch, db_path)
     _switch_tab(at, TAB_SETUP)
 
-    # 1. Sync Gmail Now
     at.button(key="t5_gmail_sync_btn").click().run()
     assert list(at.exception) == []
     assert list(at.error) == []
-    assert at.radio(key="ptos_active_tab").value == TAB_SETUP
+    assert at.segmented_control(key="ptos_active_tab").value == TAB_SETUP
 
-    # 2. Load Sample Fixtures
     at.button(key="t5_load_fixtures_btn").click().run()
     assert list(at.exception) == []
     assert list(at.error) == []
-    assert at.radio(key="ptos_active_tab").value == TAB_SETUP
+    assert at.segmented_control(key="ptos_active_tab").value == TAB_SETUP
 
-    # 3. Save Snapshot to isolated backup dir
     at.button(key="t5_save_disk_backup").click().run()
     assert list(at.exception) == []
     assert list(at.error) == []
-    assert at.radio(key="ptos_active_tab").value == TAB_SETUP
+    assert at.segmented_control(key="ptos_active_tab").value == TAB_SETUP
 
     assert len(list(backup_dir.glob("*.json"))) == 1
     assert len(list(backup_dir.glob("*.csv"))) == 1
@@ -1178,7 +1182,7 @@ def test_tab5_gmail_sync_fixtures_and_backups(
 def test_inflow_vs_outflow_separation_inline_create_and_tab3_category_studio(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify Inflow vs Outflow separation, MMF redemption targets, inline create, and Tab 3 edit/delete."""
+    """Verify Inflow vs Outflow separation, MMF redemption targets, inline create, and Category edit/delete."""
     db_path = tmp_path / "dynamic_categories.db"
     mgr = DatabaseManager(db_path)
     try:
@@ -1201,54 +1205,47 @@ def test_inflow_vs_outflow_separation_inline_create_and_tab3_category_studio(
         mgr.close()
 
     at = _create_app(monkeypatch, db_path)
+    _open_quick_add(at)
 
-    # 1. Strict separation on Tab 1 Quick-Add: CREDIT shows INFLOW categories only; DEBIT shows expense only
-    at.selectbox(key="t1_qa_type").set_value("CREDIT").run()
-    credit_opts = at.selectbox(key="t1_qa_category").options
+    # 1. CREDIT shows INFLOW categories only
+    at.selectbox(key="dlg_qa_type").set_value("CREDIT").run()
+    credit_opts = at.selectbox(key="dlg_qa_category").options
     assert "Salary & Income" in credit_opts
     assert "Freelance & Client" in credit_opts
     assert "Groceries" not in credit_opts
     assert "Food & Dining" not in credit_opts
 
-    # Create a custom INFLOW category inline right on Tab 1 Quick-Add
-    at.text_input(key="t1_qa_newcat_name").set_value("Rental Yield")
-    at.button(key="t1_qa_newcat_save").click().run()
+    # Create inline INFLOW category inside Quick-Add dialog
+    at.text_input(key="dlg_qa_newcat_name").set_value("Rental Yield")
+    at.button(key="dlg_qa_newcat_save").click().run()
     assert list(at.exception) == []
     assert list(at.error) == []
-    assert at.radio(key="ptos_active_tab").value == TAB_HOME
-    assert "Rental Yield" in at.selectbox(key="t1_qa_category").options
-    assert at.selectbox(key="t1_qa_category").value == "Rental Yield"
+    assert "Rental Yield" in at.selectbox(key="dlg_qa_category").options
+    assert at.selectbox(key="dlg_qa_category").value == "Rental Yield"
 
-    # Switching back to DEBIT must NOT show Rental Yield or Salary & Income
-    at.selectbox(key="t1_qa_type").set_value("DEBIT").run()
-    debit_opts = at.selectbox(key="t1_qa_category").options
+    at.selectbox(key="dlg_qa_type").set_value("DEBIT").run()
+    debit_opts = at.selectbox(key="dlg_qa_category").options
     assert "Groceries" in debit_opts
     assert "Rental Yield" not in debit_opts
     assert "Salary & Income" not in debit_opts
 
-    # Bidirectional MMF -> HabibMetro redemption supported cleanly under TRANSFER_INTERNAL
-    at.selectbox(key="t1_qa_account").set_value(WALLET_MMF).run()
-    assert "TRANSFER_MMF" not in [opt.split(" — ")[0] for opt in at.selectbox(key="t1_qa_type").options]
-    at.selectbox(key="t1_qa_type").set_value("TRANSFER_INTERNAL").run()
-    assert WALLET_HABIBMETRO in at.selectbox(key="t1_qa_target").options
-    assert at.selectbox(key="t1_qa_transfer_cat").value == "MMF Redemption"
+    # Bidirectional MMF -> HabibMetro redemption
+    at.selectbox(key="dlg_qa_wallet").set_value(WALLET_MMF).run()
+    assert "TRANSFER_MMF" not in [opt.split(" — ")[0] for opt in at.selectbox(key="dlg_qa_type").options]
+    at.selectbox(key="dlg_qa_type").set_value("TRANSFER_INTERNAL").run()
+    assert WALLET_HABIBMETRO in at.selectbox(key="dlg_qa_target").options
+    assert at.selectbox(key="dlg_qa_category").value == "MMF Redemption"
+    at.button(key="dlg_qa_cancel").click().run()
 
-    # 2. Tab 3 Dynamic Category Studio: add custom INFLOW, verify excluded from Outflow caps form, edit & delete
+    # 2. Tab 3 Dynamic Category Studio: add custom INFLOW, edit Food & Dining, delete custom categories
     _switch_tab(at, TAB_BUDGETS)
-    at.text_input(key="t3_nc_name").set_value("YouTube Payout")
-    at.selectbox(key="t3_nc_bucket").set_value("INFLOW").run()
-    at.button(key="t3_nc_submit").click().run()
+    at.button(key="t3_open_new_cat_btn").click().run()
+    at.text_input(key="dlg_nc_name").set_value("YouTube Payout")
+    at.selectbox(key="dlg_nc_bucket").set_value("INFLOW").run()
+    at.button(key="dlg_nc_save").click().run()
     assert list(at.exception) == []
     assert list(at.error) == []
-    assert at.radio(key="ptos_active_tab").value == TAB_BUDGETS
 
-    # Must NOT clutter Outflow category budget limits number inputs
-    assert not any(
-        "YouTube Payout" in (n.key or "")
-        for n in at.number_input
-    )
-
-    # Pick 'Food & Dining' via row '✏️ Edit' button, switch VARIABLE -> FIXED & rename -> 'Dining & Cafes'
     mgr2 = DatabaseManager(db_path)
     try:
         all_cats_now = mgr2.get_category_budgets(active_only=False)
@@ -1259,28 +1256,22 @@ def test_inflow_vs_outflow_separation_inline_create_and_tab3_category_studio(
         mgr2.close()
     assert food_id is not None and yt_id is not None and rental_id is not None
 
-    at.button(key=f"t3_cat_pick_{food_id}").click().run()
-    assert list(at.exception) == []
-    assert at.selectbox(key="t3_edit_cat_id").value == food_id
-    assert at.text_input(key="t3_ec_name").value == "Food & Dining"
-    at.text_input(key="t3_ec_name").set_value("Dining & Cafes")
-    at.selectbox(key="t3_ec_bucket").set_value("FIXED").run()
-    at.button(key="t3_ec_save_btn").click().run()
+    at.selectbox(key="t3_cat_pick_id").set_value(food_id).run()
+    at.button(key="t3_open_edit_cat_btn").click().run()
+    at.text_input(key=f"dlg_ec_name_{food_id}").set_value("Dining & Cafes")
+    at.selectbox(key=f"dlg_ec_bucket_{food_id}").set_value("FIXED").run()
+    at.button(key=f"dlg_ec_save_{food_id}").click().run()
     assert list(at.exception) == []
     assert list(at.error) == []
-    assert at.radio(key="ptos_active_tab").value == TAB_BUDGETS
 
-    # Permanently delete 'YouTube Payout' from Manage list AND 'Rental Yield' from Edit panel
-    at.button(key=f"t3_cat_del_{yt_id}").click().run()
-    assert list(at.exception) == []
-    assert list(at.error) == []
-    assert at.radio(key="ptos_active_tab").value == TAB_BUDGETS
-
-    at.button(key=f"t3_cat_pick_{rental_id}").click().run()
-    at.button(key="t3_ec_del_btn").click().run()
-    assert list(at.exception) == []
-    assert list(at.error) == []
-    assert at.radio(key="ptos_active_tab").value == TAB_BUDGETS
+    # Delete YouTube Payout & Rental Yield via Edit Category modal
+    for cid_del in (yt_id, rental_id):
+        at.selectbox(key="t3_cat_pick_id").set_value(cid_del).run()
+        at.button(key="t3_open_edit_cat_btn").click().run()
+        at.button(key=f"dlg_ec_del_arm_{cid_del}").click().run()
+        at.button(key=f"dlg_ec_del_go_{cid_del}").click().run()
+        assert list(at.exception) == []
+        assert list(at.error) == []
 
     mgr3 = DatabaseManager(db_path)
     try:
@@ -1300,7 +1291,7 @@ def test_inflow_vs_outflow_separation_inline_create_and_tab3_category_studio(
 def test_tab1_quick_tag_internal_transfer_and_tab2_transfer_pair_reconcile(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify Quick-Tag supports converting NEEDS_REVIEW DEBIT -> TRANSFER_INTERNAL and Tab 2 links pairs."""
+    """Verify Quick-Tag converts NEEDS_REVIEW DEBIT -> TRANSFER_INTERNAL and Ledger links pairs."""
     db_path = tmp_path / "own_transfer_flows.db"
     mgr = DatabaseManager(db_path)
     try:
@@ -1359,20 +1350,18 @@ def test_tab1_quick_tag_internal_transfer_and_tab2_transfer_pair_reconcile(
 
     at = _create_app(monkeypatch, db_path)
 
-    # 1. Convert top pending NEEDS_REVIEW DEBIT into HabibMetro -> NayaPay TRANSFER_INTERNAL via Quick-Tag
     at.selectbox(key=f"t1_qt_type_{qt_id}").set_value("TRANSFER_INTERNAL").run()
     at.selectbox(key=f"t1_qt_target_{qt_id}").set_value(WALLET_NAYAPAY).run()
     at.button(key=f"t1_qt_save_{qt_id}").click().run()
     assert list(at.exception) == []
     assert list(at.error) == []
-    assert at.radio(key="ptos_active_tab").value == TAB_HOME
+    assert at.segmented_control(key="ptos_active_tab").value == TAB_HOME
 
-    # 2. Switch to Tab 2 and 1-click link the remaining DEBIT + CREDIT pair across HabibMetro -> NayaPay
     _switch_tab(at, TAB_TRANSACTIONS)
     at.button(key=f"t2_pair_link_{pair_out_id}_{pair_in_id}").click().run()
     assert list(at.exception) == []
     assert list(at.error) == []
-    assert at.radio(key="ptos_active_tab").value == TAB_TRANSACTIONS
+    assert at.segmented_control(key="ptos_active_tab").value == TAB_TRANSACTIONS
 
     mgr_fin = DatabaseManager(db_path)
     try:
@@ -1393,7 +1382,7 @@ def test_tab1_quick_tag_internal_transfer_and_tab2_transfer_pair_reconcile(
 def test_tab2_re_editing_and_reapplying_rule_updates_all_similar_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Re-editing a previously applied row and clicking 'Save & Apply Rule' updates all similar rows."""
+    """Re-editing a row via Edit Modal and clicking 'Save & Apply Rule' updates all similar rows."""
     db_path = tmp_path / "reapply_rule.db"
     mgr = DatabaseManager(db_path)
     try:
@@ -1416,30 +1405,30 @@ def test_tab2_re_editing_and_reapplying_rule_updates_all_similar_rows(
     _switch_tab(at, TAB_TRANSACTIONS)
 
     # Pass 1: Tag RP_1 with keyword ZAMEEN ROASTERY -> Food & Dining
-    at.selectbox(key="t2_selected_tx_id").set_value(rp1_id).run()
-    at.selectbox(key=f"t2_edit_cat_{rp1_id}").set_value("Food & Dining").run()
-    at.text_input(key=f"t2_edit_alias_{rp1_id}").set_value("Zameen Coffee")
-    at.text_input(key=f"t2_edit_kw_{rp1_id}").set_value("ZAMEEN ROASTERY")
-    at.button(key=f"t2_btn_learn_{rp1_id}").click().run()
+    _open_edit_tx_dialog(at, rp1_id)
+    at.selectbox(key=f"dlg_ed_cat_{rp1_id}").set_value("Food & Dining").run()
+    at.text_input(key=f"dlg_ed_alias_{rp1_id}").set_value("Zameen Coffee")
+    at.text_input(key=f"dlg_ed_kw_{rp1_id}").set_value("ZAMEEN ROASTERY")
+    at.button(key=f"dlg_ed_save_rule_{rp1_id}").click().run()
     assert list(at.exception) == []
     assert list(at.error) == []
 
-    # Pass 2: Re-edit RP_1 to Shopping (FIXED) + new alias; keyword pre-fills ZAMEEN ROASTERY automatically!
-    at.selectbox(key="t2_selected_tx_id").set_value(rp1_id).run()
-    assert at.text_input(key=f"t2_edit_kw_{rp1_id}").value == "ZAMEEN ROASTERY"
-    at.selectbox(key=f"t2_edit_cat_{rp1_id}").set_value("Shopping").run()
-    at.selectbox(key=f"t2_edit_bkt_{rp1_id}").set_value("FIXED").run()
-    at.text_input(key=f"t2_edit_alias_{rp1_id}").set_value("Zameen Mart")
-    at.button(key=f"t2_btn_learn_{rp1_id}").click().run()
+    # Pass 2: Re-edit RP_1 -> Shopping (FIXED); keyword pre-fills ZAMEEN ROASTERY automatically
+    _open_edit_tx_dialog(at, rp1_id)
+    assert at.text_input(key=f"dlg_ed_kw_{rp1_id}").value == "ZAMEEN ROASTERY"
+    at.selectbox(key=f"dlg_ed_cat_{rp1_id}").set_value("Shopping").run()
+    at.selectbox(key=f"dlg_ed_bkt_{rp1_id}").set_value("FIXED").run()
+    at.text_input(key=f"dlg_ed_alias_{rp1_id}").set_value("Zameen Mart")
+    at.button(key=f"dlg_ed_save_rule_{rp1_id}").click().run()
     assert list(at.exception) == []
     assert list(at.error) == []
 
-    # Also convert OWN IBFT TRANSFER group from DEBIT -> TRANSFER_INTERNAL -> NayaPay across both rows
-    at.selectbox(key="t2_selected_tx_id").set_value(tr1_id).run()
-    at.selectbox(key=f"t2_edit_type_{tr1_id}").set_value("TRANSFER_INTERNAL").run()
-    at.selectbox(key=f"t2_edit_target_{tr1_id}").set_value(WALLET_NAYAPAY).run()
-    at.text_input(key=f"t2_edit_kw_{tr1_id}").set_value("OWN IBFT TRANSFER")
-    at.button(key=f"t2_btn_learn_{tr1_id}").click().run()
+    # Convert OWN IBFT TRANSFER group -> TRANSFER_INTERNAL -> NayaPay across both rows
+    _open_edit_tx_dialog(at, tr1_id)
+    at.selectbox(key=f"dlg_ed_type_{tr1_id}").set_value("TRANSFER_INTERNAL").run()
+    at.selectbox(key=f"dlg_ed_target_{tr1_id}").set_value(WALLET_NAYAPAY).run()
+    at.text_input(key=f"dlg_ed_kw_{tr1_id}").set_value("OWN IBFT TRANSFER")
+    at.button(key=f"dlg_ed_save_rule_{tr1_id}").click().run()
     assert list(at.exception) == []
     assert list(at.error) == []
 
@@ -1484,14 +1473,12 @@ def test_lock_screen_gate_rate_limit_timeout_and_manual_lock(
         getattr(w, "key", None) == target_key for w in widget_list
     )
 
-    # 1. Locked by default: lock input shown, main tabs and private ledger payees hidden
     assert list(at.exception) == []
     assert has_key(at.text_input, "ptos_lock_password")
-    assert not has_key(at.radio, "ptos_active_tab")
+    assert not has_key(at.segmented_control, "ptos_active_tab")
     rendered_text = " ".join(m.value for m in at.markdown)
     assert "Private Wealth Transfer" not in rendered_text
 
-    # 2. Five failed unlock attempts trigger brute-force cooldown lockout
     for attempt in range(5):
         at.text_input(key="ptos_lock_password").set_value(f"wrong-{attempt}")
         at.button[0].click().run()
@@ -1501,7 +1488,6 @@ def test_lock_screen_gate_rate_limit_timeout_and_manual_lock(
     )
     assert at.text_input(key="ptos_lock_password").disabled is True
 
-    # Reset limiter & unlock with valid credentials
     from src.security import get_auth_rate_limiter
 
     get_auth_rate_limiter().reset()
@@ -1511,21 +1497,19 @@ def test_lock_screen_gate_rate_limit_timeout_and_manual_lock(
 
     assert list(at.exception) == []
     assert list(at.error) == []
-    assert has_key(at.radio, "ptos_active_tab")
+    assert has_key(at.segmented_control, "ptos_active_tab")
     assert has_key(at.button, "ptos_lock_btn")
 
-    # 3. Simulate idle timeout expiry (> 5 min) -> automatically re-locks
     at.session_state["ptos_auth_last_active"] = _time.monotonic() - 600.0
     at.run()
     assert has_key(at.text_input, "ptos_lock_password")
     assert any("inactivity" in info.value.lower() for info in at.info)
 
-    # Re-unlock then test manual Lock button in top bar
     at.text_input(key="ptos_lock_password").set_value("VaultPass#2026")
     at.button[0].click().run()
     at.button(key="ptos_lock_btn").click().run()
     assert has_key(at.text_input, "ptos_lock_password")
-    assert not has_key(at.radio, "ptos_active_tab")
+    assert not has_key(at.segmented_control, "ptos_active_tab")
 
 
 def test_tab5_cloud_vault_auto_push_and_manual_controls(
@@ -1581,19 +1565,16 @@ def test_tab5_cloud_vault_auto_push_and_manual_controls(
     assert list(at.exception) == []
     assert list(at.error) == []
 
-    # Manual Push Vault to Cloud button works
     at.button(key="t5_cloud_push_btn").click().run()
     assert list(at.exception) == []
     assert list(at.error) == []
     assert "content" in gist_store
     assert "Vault Espresso Bar" not in gist_store["content"]
 
-    # Manual Pull Vault from Cloud restores cleanly
     at.button(key="t5_cloud_pull_btn").click().run()
     assert list(at.exception) == []
     assert list(at.error) == []
 
-    # Quick-Tag Verify/Save mutation on Tab 1 triggers automatic cloud vault sync
     _switch_tab(at, TAB_HOME)
     gist_store["content"] = "stale"
     with DatabaseManager(db_path) as mgr:
@@ -1606,4 +1587,96 @@ def test_tab5_cloud_vault_auto_push_and_manual_controls(
     assert "Vault Espresso Bar" not in gist_store["content"]
 
 
+def test_redesigned_ui_badges_rules_edit_bill_and_deferred_downloads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify Over Budget strictly >100%, Learned Rules delete, Bill Edit modal, and deferred download."""
+    db_path = tmp_path / "ui_redesign_new.db"
+    mgr = DatabaseManager(db_path)
+    try:
+        mgr.upsert_category_budget("Groceries", 10000.0, "🛒", "VARIABLE", is_active=True)
+        mgr.upsert_category_budget("Dining", 10000.0, "🍽️", "VARIABLE", is_active=True)
+        mgr.upsert_many(
+            [
+                TransactionRecord(
+                    message_id="OVB_1",
+                    tx_date="2026-11-05",
+                    account_name=WALLET_NAYAPAY,
+                    tx_type="DEBIT",
+                    amount=9700.0,
+                    payee="IMTIAZ TEST",
+                    category="Groceries",
+                    cost_bucket="VARIABLE",
+                    review_status="AUTO_VERIFIED",
+                ),
+                TransactionRecord(
+                    message_id="OVB_2",
+                    tx_date="2026-11-06",
+                    account_name=WALLET_NAYAPAY,
+                    tx_type="DEBIT",
+                    amount=10500.0,
+                    payee="CAFE TEST",
+                    category="Dining",
+                    cost_bucket="VARIABLE",
+                    review_status="AUTO_VERIFIED",
+                ),
+            ]
+        )
+        learn_new_rule(
+            db=mgr,
+            payee="CUSTOM RULE TEST",
+            alias="Custom Rule",
+            category="Dining",
+            cost_bucket="VARIABLE",
+            keyword="CUSTOM RULE TEST",
+        )
+        bill = mgr.upsert_recurring_commitment(
+            RecurringCommitment(
+                title="StormFiber Monthly",
+                match_keyword="STORMFIBER",
+                expected_amount=4200.0,
+                due_day=12,
+                category="Bills & Utilities",
+                cost_bucket="FIXED",
+                is_active=True,
+            )
+        )
+        rule_id = next(r.id for r in mgr.get_category_rules() if r.keyword == "CUSTOM RULE TEST")
+    finally:
+        mgr.close()
+    assert bill.id is not None and rule_id is not None
 
+    monkeypatch.setenv("TREASURY_BACKUP_KEY", "DeferredPass#123")
+    monkeypatch.setattr(
+        DatabaseManager,
+        "export_encrypted_backup",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("PBKDF2 ran eagerly on page render!")),
+    )
+
+    at = _create_app(monkeypatch, db_path)
+    md_home = "\n".join(m.value for m in at.markdown)
+    # 97% must NOT say Over Budget!; 105% DOES say Over Budget!
+    assert "Near Limit" in md_home
+    assert "Over Budget!" in md_home
+    assert md_home.count("Over Budget!") == 1
+
+    # Edit Recurring Bill modal updates commitment cleanly
+    _switch_tab(at, TAB_BUDGETS)
+    at.button(key=f"t3_bill_edit_{bill.id}").click().run()
+    at.number_input(key=f"dlg_eb_amt_{bill.id}").set_value(4800.0)
+    at.button(key=f"dlg_eb_save_{bill.id}").click().run()
+    assert list(at.exception) == []
+
+    # Switching to Setup with TREASURY_BACKUP_KEY must NOT trigger eager export_encrypted_backup!
+    _switch_tab(at, TAB_SETUP)
+    assert list(at.exception) == []
+    assert any(b.key == "t5_dl_enc" for b in at.get("download_button"))
+
+    # Learned Rules 1-click delete works
+    at.button(key=f"t5_del_rule_{rule_id}").click().run()
+    assert list(at.exception) == []
+
+    with DatabaseManager(db_path) as chk:
+        updated_bill = next(b for b in chk.get_recurring_commitments() if b.id == bill.id)
+        assert updated_bill.expected_amount == pytest.approx(4800.0)
+        assert not any(r.id == rule_id for r in chk.get_category_rules())

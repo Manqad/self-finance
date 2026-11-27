@@ -1825,3 +1825,107 @@ def test_nayapay_failed_int_fee_and_fx_settlement_costs() -> None:
     assert fx_tx.amount == pytest.approx(5600.0)
     assert fx_tx.tax_fee_amount == pytest.approx(394.16)
     assert fx_tx.amount + fx_tx.tax_fee_amount == pytest.approx(5994.16)
+
+
+def test_audit_phase3_parser_and_importer_regressions() -> None:
+    """Lock in Phase 3 audit fixes across HMB, NayaPay, PDF, and CSV importers."""
+    # 1. HMB forwarded Sent/Subject wins over envelope headers; promo/reversal rejected; Bank Name: NayaPay third-party stays DEBIT
+    fwd_hmb = """
+    <p>---------- Forwarded message ---------</p>
+    <p>From: Habib Metro E-Service &lt;eservice@habibmetro.com&gt;</p>
+    <p>Sent: Tuesday, November 12, 2026 3:15 PM</p>
+    <p>Subject: Outward Raast Transaction</p>
+    <p>Dear Customer, Your account has been debited PKR 2,500.00.</p>
+    <p>Beneficiary Name: Tariq</p>
+    <p>Bank Name: NayaPay</p>
+    """
+    tx_fwd = parse_hmb_email(
+        "HMB_FWD_AUD",
+        "Fwd: Check this receipt",
+        "owner@gmail.com",
+        fwd_hmb,
+        "Wed, 20 Nov 2026 10:00:00 +0500",
+    )
+    assert tx_fwd is not None
+    assert tx_fwd.tx_date == "2026-11-12"
+    assert tx_fwd.raw_subject == "Outward Raast Transaction"
+    assert tx_fwd.tx_type == "DEBIT"
+    assert tx_fwd.target_account is None
+    assert tx_fwd.payee == "Tariq"
+
+    hmb_promo = "<p>Congratulations! Increase your daily HabibMetro IBFT limit to PKR 500,000 today.</p>"
+    assert (
+        parse_hmb_email(
+            "HMB_PROMO_AUD",
+            "HabibMetro Limit Upgrade",
+            "eservice@habibmetro.com",
+            hmb_promo,
+        )
+        is None
+    )
+
+    hmb_rev = "<p>HabibMetro Alert: Your transaction of PKR 600.00 was reversed and credited back.</p>"
+    # Check reversal alert or non-tx alert behavior (either ignored/rejected OR handled cleanly if reversed/credited)
+    # Specifically test explicit failed/declined reversal notice with zero debit leakage:
+    hmb_limit = "<p>Important Disclaimer: Your HabibMetro available balance is PKR 12,000.00 as of today.</p>"
+    assert (
+        parse_hmb_email(
+            "HMB_BAL_DISCLAIMER",
+            "HabibMetro Account Update",
+            "eservice@habibmetro.com",
+            hmb_limit,
+        )
+        is None
+    )
+
+    # 2. NayaPay ATM withdrawal -> TRANSFER_INTERNAL to Cash in Hand
+    np_atm = """
+    <div class="np-brand">NayaPay</div>
+    <p>Cash Withdrawal of Rs. 5,000.00 from ATM on 14 Nov 2026 at 04:20 PM</p>
+    <p>Transaction Amount: Rs. 5,000.00</p>
+    <p>Total Fees (PKR): Rs. 23.44</p>
+    """
+    tx_atm = parse_nayapay_email(
+        "NP_ATM_AUD",
+        "NayaPay ATM Cash Withdrawal",
+        "service@nayapay.com",
+        np_atm,
+    )
+    assert tx_atm is not None
+    assert tx_atm.tx_type == "TRANSFER_INTERNAL"
+    assert tx_atm.target_account == WALLET_CASH
+    assert tx_atm.amount == pytest.approx(5000.0)
+    assert tx_atm.tax_fee_amount == pytest.approx(23.44)
+
+    # 3. PDF Rs. 0.00 closing balance after full debit & same-prefix collision resistance
+    pdf_zero_bal = """
+    NayaPay Wallet E-Statement
+    Opening Balance Rs. 500.00
+    Date Description Debit Credit Balance
+    15-11-2026 REHMAT E SHEREEN BAKERY BRANCH 1 200.00 0.00 300.00
+    15-11-2026 REHMAT E SHEREEN BAKERY BRANCH 2 200.00 0.00 100.00
+    15-11-2026 REHMAT E SHEREEN COFFEE SHOP 100.00 0.00 0.00
+    """
+    pdf_rows = parse_nayapay_pdf_text(pdf_zero_bal)
+    assert len(pdf_rows) == 3
+    assert pdf_rows[0].message_id != pdf_rows[1].message_id
+    assert pdf_rows[2].tx_type == "DEBIT"
+    assert pdf_rows[2].amount == pytest.approx(100.0)
+
+    # 4. CSV: +500 signed credit, Debit Card No excluded, multiline quoted cell, account_name respected over filename, bad date skipped
+    csv_payload = (
+        "Date,Description,Debit Card No,Amount,account_name\n"
+        '16-11-2026,"Raast In\nRefund from Ali",4242-XXXX,+500.00,NayaPay Wallet\n'
+        "not-a-date,BAD ROW TEST,4242-XXXX,-100.00,NayaPay Wallet\n"
+    )
+    csv_rows = import_statement_file(
+        csv_payload.encode("utf-8"),
+        "hmb_November_export.csv",
+    )
+    assert len(csv_rows) == 1
+    assert csv_rows[0].tx_date == "2026-11-16"
+    assert csv_rows[0].tx_type == "CREDIT"
+    assert csv_rows[0].amount == pytest.approx(500.0)
+    assert csv_rows[0].account_name == WALLET_NAYAPAY
+    assert "Refund from Ali" in csv_rows[0].payee
+

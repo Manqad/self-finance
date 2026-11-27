@@ -1042,3 +1042,223 @@ def test_canonical_payee_rule_matching_and_verified_history_inheritance(
     assert credit_same_name.review_status == "NEEDS_REVIEW"
     assert credit_same_name.cost_bucket == "INFLOW"
 
+
+def test_audit_phase1_categorizer_metrics_and_recurring_regressions(
+    db: DatabaseManager,
+) -> None:
+    """Lock in Phase 1 audit fixes: user override, MMF/CREDIT safety, Envelope & closed/future metrics, 1-to-1 bills."""
+    from src.models import BudgetConfig, CategoryBudget, RecurringCommitment
+
+    # 1. Priority-100 user override beats parser-preclassified internal transfer
+    learn_new_rule(
+        db=db,
+        payee="CUSTOM NAYA STORE",
+        alias="Custom Naya Store",
+        category="Shopping",
+        cost_bucket="VARIABLE",
+        keyword="CUSTOM NAYA STORE",
+    )
+    preclassified_transfer = ParsedTransaction(
+        message_id="OVR_TX_1",
+        tx_date="2026-11-12",
+        account_name=WALLET_HABIBMETRO,
+        target_account=WALLET_NAYAPAY,
+        tx_type="TRANSFER_INTERNAL",
+        amount=3000.0,
+        payee="CUSTOM NAYA STORE NayaPay",
+        source="GMAIL_HMB",
+        suggested_category="Wallet Top-Up",
+        suggested_bucket="IGNORE",
+    )
+    res_ovr = apply_rules(preclassified_transfer, db)
+    assert res_ovr.tx_type == "DEBIT"
+    assert res_ovr.target_account is None
+    assert res_ovr.category == "Shopping"
+    assert res_ovr.cost_bucket == "VARIABLE"
+    assert res_ovr.is_internal_transfer is False
+
+    # 2. WALLET_MMF DEBIT never converts to TRANSFER_MMF -> WALLET_MMF
+    mmf_debit = apply_rules(
+        _parsed("MMF_DEB_1", "AL MEEZAN FEE", 250.0, account_name=WALLET_MMF),
+        db,
+    )
+    assert mmf_debit.tx_type == "DEBIT"
+    assert mmf_debit.target_account is None
+
+    # 3. CREDIT skips debit default rules (e.g., K-ELECTRIC refund stays INFLOW)
+    ke_refund = apply_rules(
+        _parsed("KE_CRED_1", "K-ELECTRIC REFUND", 1200.0, tx_type="CREDIT"),
+        db,
+    )
+    assert ke_refund.tx_type == "CREDIT"
+    assert ke_refund.cost_bucket == "INFLOW"
+    assert ke_refund.total_outflow() == 0.0
+
+    # 4. Envelope Mode: sweeps + return fees + MMF redemptions + granular Bank & Tax Friction
+    db.update_budget_config(
+        monthly_income=200000.0,
+        fixed_cost_baseline=80000.0,
+        variable_spending_cap=40000.0,
+        emergency_multiplier=6,
+        envelope_mode=True,
+    )
+    db.upsert_category_budget(
+        category="Food & Dining",
+        monthly_limit=10000.0,
+        emoji="🍔",
+        cost_bucket="VARIABLE",
+        is_active=True,
+    )
+    db.upsert_many(
+        [
+            # HMB -> NayaPay top-up Rs. 31,000 (after Rs. 25,000 NayaPay->MMF sweep, net envelope burn = Rs. 6,000)
+            TransactionRecord(
+                message_id="ENV_NP_TOPUP",
+                tx_date="2026-11-05",
+                tx_timestamp="2026-11-05 09:00:00",
+                account_name=WALLET_HABIBMETRO,
+                target_account=WALLET_NAYAPAY,
+                tx_type="TRANSFER_INTERNAL",
+                amount=31000.0,
+                payee="IBFT NayaPay Topup",
+                category="Wallet Top-Up",
+                cost_bucket="IGNORE",
+                review_status="AUTO_VERIFIED",
+                is_internal_transfer=True,
+                source="GMAIL_HMB",
+            ),
+            # HMB -> Cash Withdrawal Rs. 5,000 + Rs. 23.44 ATM fee (fee counts in Envelope Leakage)
+            TransactionRecord(
+                message_id="ENV_CASH_1",
+                tx_date="2026-11-05",
+                tx_timestamp="2026-11-05 10:00:00",
+                account_name=WALLET_HABIBMETRO,
+                target_account=WALLET_CASH,
+                tx_type="TRANSFER_INTERNAL",
+                amount=5000.0,
+                tax_fee_amount=23.44,
+                payee="ATM Cash Withdrawal",
+                category="Cash Withdrawal",
+                cost_bucket="IGNORE",
+                review_status="AUTO_VERIFIED",
+                is_internal_transfer=True,
+                source="GMAIL_HMB",
+            ),
+            # NayaPay -> MMF Rs. 25,000 sweep + MMF Redemption Rs. 5,000 back to HMB
+            TransactionRecord(
+                message_id="ENV_MMF_SWEEP",
+                tx_date="2026-11-06",
+                tx_timestamp="2026-11-06 11:00:00",
+                account_name=WALLET_NAYAPAY,
+                target_account=WALLET_MMF,
+                tx_type="TRANSFER_MMF",
+                amount=25000.0,
+                payee="Al Meezan MCF Sweep",
+                category="Money Market Fund",
+                cost_bucket="INVESTMENT",
+                review_status="AUTO_VERIFIED",
+                is_internal_transfer=True,
+                source="MANUAL",
+            ),
+            TransactionRecord(
+                message_id="ENV_MMF_REDEMP",
+                tx_date="2026-11-08",
+                tx_timestamp="2026-11-08 11:00:00",
+                account_name=WALLET_MMF,
+                target_account=WALLET_HABIBMETRO,
+                tx_type="TRANSFER_INTERNAL",
+                amount=5000.0,
+                payee="Al Meezan MCF Redemption",
+                category="MMF Redemption",
+                cost_bucket="IGNORE",
+                review_status="AUTO_VERIFIED",
+                is_internal_transfer=True,
+                source="MANUAL",
+            ),
+            # Card purchase Rs. 1,000 + Rs. 50 WHT on NayaPay (tax goes to granular Bank & Tax Friction bar, excluded from envelope cap)
+            TransactionRecord(
+                message_id="ENV_NP_SPEND",
+                tx_date="2026-11-09",
+                tx_timestamp="2026-11-09 12:00:00",
+                account_name=WALLET_NAYAPAY,
+                tx_type="DEBIT",
+                amount=1000.0,
+                tax_fee_amount=50.0,
+                payee="NETFLIX",
+                category="Food & Dining",
+                cost_bucket="VARIABLE",
+                review_status="AUTO_VERIFIED",
+                source="GMAIL_NAYAPAY",
+            ),
+        ]
+    )
+    m_env = compute_dashboard_metrics(db, "2026-11", reference_date=date(2026, 11, 10))
+    assert m_env.monthly_mmf_swept == pytest.approx(20000.0)
+    assert m_env.actual_variable_burn == pytest.approx(6000.0)
+    assert m_env.actual_leakage_burn == pytest.approx(23.44)
+    cat_map_env = {cp.category: cp for cp in m_env.category_progress}
+    assert cat_map_env["Bank & Tax Friction"].spent == pytest.approx(73.44)
+    assert cat_map_env["Food & Dining"].spent == pytest.approx(1000.0)
+
+    # 5. Closed-month safe_daily_spend=0.0; future-month pace/MoM=0.0
+    m_closed = compute_dashboard_metrics(db, "2026-11", reference_date=date(2026, 12, 5))
+    assert m_closed.days_remaining == 0
+    assert m_closed.safe_daily_spend == pytest.approx(0.0)
+
+    m_future = compute_dashboard_metrics(db, "2026-12", reference_date=date(2026, 11, 10))
+    assert m_future.days_elapsed == 0
+    assert m_future.actual_daily_burn_pace == pytest.approx(0.0)
+    assert m_future.mom_pace_delta_pct == pytest.approx(0.0)
+    assert m_future.prev_month_daily_burn_pace == pytest.approx(0.0)
+
+    # 6. 1-to-1 recurring bill claiming + [bill:id] scoping + OVERDUE/DUE_SOON
+    db.upsert_recurring_commitment(
+        RecurringCommitment(
+            title="Duplicate Fiber Bill A",
+            match_keyword="FIBER_NET",
+            expected_amount=4000.0,
+            due_day=5,
+            category="Bills & Utilities",
+            cost_bucket="FIXED",
+        )
+    )
+    db.upsert_recurring_commitment(
+        RecurringCommitment(
+            title="Duplicate Fiber Bill B",
+            match_keyword="FIBER_NET",
+            expected_amount=4000.0,
+            due_day=20,
+            category="Bills & Utilities",
+            cost_bucket="FIXED",
+        )
+    )
+    # Remove auto-seeded recurring noise other than our two test bills if needed; fetch our IDs
+    bills = db.get_recurring_commitments()
+    bill_a = next(b for b in bills if b.title == "Duplicate Fiber Bill A")
+    bill_b = next(b for b in bills if b.title == "Duplicate Fiber Bill B")
+    # Single tx matching FIBER_NET must only claim ONE bill (1-to-1) and honor explicit [bill:id]
+    db.upsert_transaction(
+        TransactionRecord(
+            message_id="REC_SCOPE_1",
+            tx_date="2026-11-12",
+            tx_timestamp="2026-11-12 09:00:00",
+            account_name=WALLET_HABIBMETRO,
+            tx_type="DEBIT",
+            amount=4000.0,
+            payee="FIBER_NET PAYMENT",
+            category="Bills & Utilities",
+            cost_bucket="FIXED",
+            review_status="AUTO_VERIFIED",
+            source="GMAIL_HMB",
+            notes=f"[bill:{bill_b.id}] Paid B first",
+        )
+    )
+    statuses = sync_recurring_status(db, "2026-11", reference_date=date(2026, 11, 15))
+    st_map = {s.commitment.id: s for s in statuses}
+    assert st_map[bill_b.id].is_paid is True
+    assert st_map[bill_b.id].status == "PAID"
+    assert st_map[bill_a.id].is_paid is False
+    assert st_map[bill_a.id].status == "OVERDUE"
+    assert st_map[bill_a.id].due_date == "2026-11-05"
+
+

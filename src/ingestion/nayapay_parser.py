@@ -6,12 +6,14 @@ import re
 from typing import Optional
 
 from src.ingestion.hmb_parser import (
+    _extract_outlook_forward_meta,
     html_to_structured_text,
     is_ignored_bank_alert,
     normalize_datetime_str,
     parse_amount_value,
 )
 from src.models import (
+    WALLET_CASH,
     WALLET_NAYAPAY,
     CostBucket,
     ParsedTransaction,
@@ -19,7 +21,9 @@ from src.models import (
 )
 
 _NAYAPAY_SENDER_RE = re.compile(r"(?i)nayapay\.com|\bnaya\s*pay\b")
-_NAYAPAY_INNER_FROM_RE = re.compile(r"(?im)^from\s*:\s*[^\n]*\bnaya\s*pay\b")
+_NAYAPAY_INNER_FROM_RE = re.compile(
+    r"(?im)^from\s*:\s*[^\n]*(?:service@nayapay|nayapay\.com|naya\s*pay[^\n]*(?:@|<[^>\n]+>))"
+)
 _NAYAPAY_BRANDING_RE = re.compile(
     r"(?i)(?:nayapay\.com|"
     r"\bnayapay(?:\s+[a-z]+){0,3}\s+(?:receipt|alert|wallet|card|e-?statement|transaction)\b|"
@@ -31,7 +35,8 @@ _HMB_ORIGIN_RE = re.compile(
     r"(?i)(habib\s*metro|habibmetro|eservice@habibmetro)"
 )
 _HMB_INNER_FROM_RE = re.compile(
-    r"(?im)^from\s*:\s*[^\n]*(?:habib\s*metro|habibmetro|eservice@habibmetro)"
+    r"(?im)^from\s*:\s*[^\n]*(?:(?:@|<[^>\n]+>)[^\n]*(?:habib\s*metro|habibmetro)|"
+    r"(?:habib\s*metro|habibmetro)[^\n]*(?:@|<[^>\n]+>)|eservice@habibmetro)"
 )
 
 _BAL_QUALIFIER = (
@@ -55,7 +60,7 @@ _EXCLUSIVE_RE = re.compile(
 _HERO_CREDIT_RE = re.compile(
     r"(?i)\b(?:money\s+received|you\s+(?:received|got)|received\s+(?:a\s+)?refund|"
     r"refund(?:\s+(?:received|credited|processed|issued|alert))?|cashback\s+received|"
-    r"inward\s+raast|has\s+been\s+credited)\b"
+    r"inward\s+(?:raast|ibft)|has\s+been\s+credited|revers(?:al|ed)\s+(?:of|for))\b"
 )
 _HERO_DEBIT_RE = re.compile(
     r"(?i)\b(?:you\s+(?:paid|spent)|money\s+sent|sent\s+(?:rs\.?|pkr)\s*[0-9]|"
@@ -65,7 +70,7 @@ _HERO_DEBIT_RE = re.compile(
 _CREDIT_RE = re.compile(
     r"(?i)\b(?:money\s+received|you\s+(?:received|got)|got\s+(?:rs\.?|pkr|from)|"
     r"received\s+(?:rs\.?|pkr|from|a\s+refund)|"
-    r"amount\s+received|credited|cashback(?:\s+received)?|refund(?:ed)?|"
+    r"amount\s+received|credited|cashback(?:\s+received)?|refund(?:ed)?|revers(?:al|ed)|"
     r"funds?\s+received|inward\s+(?:raast|ibft)|wallet\s+load|load\s+money|"
     r"added\s+to\s+your\s+wallet|sent\s+you)\b"
 )
@@ -97,10 +102,10 @@ _BASE_LABEL_RE = re.compile(
     r"principal\s+amount|payment\s+amount|card\s+amount|amount)$"
 )
 _SUMMARY_TAX_LABEL_RE = re.compile(
-    r"(?i)^(?:total\s+(?:tax(?:es)?|fee(?:s)?|charges)|"
-    r"(?:total\s+)?tax(?:es)?\s*(?:&|and|/)\s*fee(?:s)?|"
-    r"(?:total\s+)?fee(?:s)?\s*(?:&|and|/)\s*tax(?:es)?|"
-    r"(?:total\s+)?fee(?:s)?\s*(?:&|and|/)\s*charges)$"
+    r"(?i)^(?:total\s+(?:tax(?:es)?|fee(?:s)?|charges|bank\s+charges|service\s+charges)|"
+    r"(?:total\s+)?tax(?:es)?\s*(?:&|and|/)\s*(?:fee(?:s)?|charges)|"
+    r"(?:total\s+)?fee(?:s)?\s*(?:&|and|/)\s*(?:tax(?:es)?|charges)|"
+    r"(?:total\s+)?charges\s*(?:&|and|/)\s*tax(?:es)?)$"
 )
 _INDIVIDUAL_TAX_LABEL_RE = re.compile(
     r"(?i)(?:wht|withholding\s+tax|advance\s+(?:income\s+)?tax|"
@@ -115,7 +120,8 @@ _INDIVIDUAL_TAX_LABEL_RE = re.compile(
 
 _INLINE_TAX_RE = re.compile(
     r"(?i)\b(?:withholding\s+tax|advance\s+(?:income\s+)?tax|income\s+tax|"
-    r"fbr\s+tax|wht|fx\s+fee|foreign(?:\s+currency|\s+transaction)?\s+fee|"
+    r"fbr\s+tax|wht|fx\s+fee|fx\s+settlement\s+costs?|settlement\s+costs?|sst|"
+    r"foreign(?:\s+currency|\s+transaction)?\s+fee|"
     r"international(?:\s+transaction)?\s+fee|cross[\s\-]*border\s+fee|"
     r"currency\s+conversion\s+fee|service\s+fee|transaction\s+fee|"
     r"processing\s+fee|convenience\s+fee|card\s+fee|fed|federal\s+excise(?:\s+duty)?|"
@@ -164,12 +170,12 @@ _DEBIT_PAYEE_LABELS = (
     "Receiver",
     "Recipient Name",
     "Recipient",
-    "To Account Title",
-    "Account Title",
-    "Transfer To",
-    "Sent To",
     "Beneficiary Name",
     "Beneficiary",
+    "To Account Title",
+    "Transfer To",
+    "Sent To",
+    "Account Title",
     "Biller Name",
     "Biller",
     "Store",
@@ -185,26 +191,30 @@ _CREDIT_PAYEE_LABELS = (
     "Remitter",
     "Merchant Name",
     "Merchant",
-    "Account Title",
     "From",
+    "Account Title",
     "Description",
 )
 
 
 def _nayapay_html_to_lines(raw_html_or_text: str) -> list[str]:
-    """Parse NayaPay HTML tables/flex-rows/text into normalized non-empty lines."""
+    """Parse NayaPay HTML tables/flex-rows/text into normalized non-empty lines (forward-safe)."""
     structured = html_to_structured_text(raw_html_or_text)
-    return [ln for ln in structured.splitlines() if ln]
+    cleaned, _, _ = _extract_outlook_forward_meta(structured)
+    return [ln for ln in cleaned.splitlines() if ln]
+
+
+_FAILED_FEE_PAID_RE = re.compile(
+    r"(?i)\b(?:you\s+paid\s+the\s+failed\s+int(?:ernational)?\.?\s+transaction\s+fee|"
+    r"failed\s+int(?:ernational)?\.?\s+transaction\s+fee\s+(?:charged|debited|paid))\b"
+)
 
 
 def is_ignored_nayapay_email(subject: str, body: str) -> bool:
-    """Return True for OTP/verification/login alerts or non-refund declined/failed alerts."""
+    """Return True for OTP/verification/login/promo/limit alerts or non-refund declined/failed alerts."""
     lines = _nayapay_html_to_lines(body)
     combined = f"{subject or ''}\n" + "\n".join(lines)
-    if re.search(
-        r"(?i)\byou\s+paid\s+the\s+failed\s+int(?:ernational)?\.?\s+transaction\s+fee\b",
-        combined,
-    ):
+    if _FAILED_FEE_PAID_RE.search(combined):
         return False
     return is_ignored_bank_alert(combined)
 
@@ -213,6 +223,9 @@ def is_nayapay_email(subject: str, sender: str, body: str) -> bool:
     """Detect NayaPay receipt emails while rejecting unrelated Uber/SadaPay/HMB-only alerts."""
     sender_l = (sender or "").lower()
     subject_l = (subject or "").lower()
+    if _HMB_ORIGIN_RE.search(sender_l) and not _NAYAPAY_SENDER_RE.search(sender_l):
+        return False
+
     lines_text = "\n".join(_nayapay_html_to_lines(body))
     combined = f"{subject or ''}\n{lines_text}"
 
@@ -222,9 +235,7 @@ def is_nayapay_email(subject: str, sender: str, body: str) -> bool:
     if np_sender_or_from:
         return True
 
-    hmb_origin = bool(
-        _HMB_ORIGIN_RE.search(sender_l) or _HMB_INNER_FROM_RE.search(combined)
-    )
+    hmb_origin = bool(_HMB_INNER_FROM_RE.search(combined))
     if hmb_origin:
         return False
 
@@ -299,7 +310,7 @@ def _extract_amounts_and_taxes(
 
         m_explicit_curr = _CURRENCY_ANY_RE.search(val_str)
         m_plain_num = re.match(
-            r"^\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)\s*(?:PKR|Rs\.?)?\s*$",
+            r"^\s*[+-]?\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)\s*(?:PKR|Rs\.?)?\s*$",
             val_str,
             re.IGNORECASE,
         )
@@ -311,6 +322,7 @@ def _extract_amounts_and_taxes(
         if amt is None:
             continue
 
+        label_has_curr = bool(re.search(r"(?i)\((?:PKR|Rs\.?)\)", raw_label))
         if _TOTAL_LABEL_RE.match(label_clean):
             explicit_total = amt
         elif _BASE_LABEL_RE.match(raw_label) or _BASE_LABEL_RE.match(label_clean):
@@ -321,11 +333,10 @@ def _extract_amounts_and_taxes(
                 elif _INCLUSIVE_RE.search(raw_label) or _INCLUSIVE_RE.search(val_str):
                     base_incl_tax = True
         elif _SUMMARY_TAX_LABEL_RE.match(label_clean):
-            # Require explicit PKR/Rs currency on tax/fee lines
-            if m_explicit_curr is not None:
+            if m_explicit_curr is not None or label_has_curr:
                 summary_tax_sum += amt
         elif _INDIVIDUAL_TAX_LABEL_RE.search(raw_label) and not _EXCLUSIVE_RE.search(raw_label):
-            if m_explicit_curr is not None:
+            if m_explicit_curr is not None or label_has_curr:
                 individual_tax_sum += amt
         else:
             unmatched_lines.append(ln)
@@ -363,14 +374,14 @@ def _extract_amounts_and_taxes(
             base_amount = round(explicit_base - tax_fee_amount, 2)
         else:
             base_amount = round(explicit_base, 2)
-            if (
-                explicit_total is not None
-                and explicit_total > base_amount + 0.01
-                and not base_incl_tax
-            ):
-                implied_tax = round(explicit_total - base_amount, 2)
-                if implied_tax > tax_fee_amount:
-                    tax_fee_amount = implied_tax
+            if explicit_total is not None:
+                if explicit_total > base_amount + 0.01 and not base_incl_tax:
+                    implied_tax = round(explicit_total - base_amount, 2)
+                    if implied_tax > tax_fee_amount:
+                        tax_fee_amount = implied_tax
+                elif explicit_total < base_amount - 0.01 and tax_fee_amount == 0.0:
+                    # Discounted order: use actual total charged/paid
+                    base_amount = round(explicit_total, 2)
     elif explicit_total is not None:
         if tax_fee_amount > 0.0 and explicit_total > tax_fee_amount + 0.05:
             base_amount = round(explicit_total - tax_fee_amount, 2)
@@ -380,8 +391,11 @@ def _extract_amounts_and_taxes(
     elif hero_amount is not None:
         if (
             tax_fee_amount > 0.0
-            and hero_amount > tax_fee_amount
-            and _INCLUSIVE_RE.search(joined_safe)
+            and hero_amount > tax_fee_amount + 0.05
+            and (
+                _INCLUSIVE_RE.search(joined_safe)
+                or re.search(r"(?i)\byou\s+(?:spent|paid)\s+(?:PKR|Rs\.?|PK\s*Rs\.?)", f"{subject or ''}\n{joined_safe}")
+            )
         ):
             base_amount = round(hero_amount - tax_fee_amount, 2)
         else:
@@ -410,12 +424,17 @@ def _extract_amounts_and_taxes(
 
 
 def _detect_nayapay_direction(subject: str, joined_text: str) -> TxType:
-    """Detect CREDIT vs DEBIT on a NayaPay receipt, prioritizing refund/credit hero cues."""
-    combined = f"{subject or ''}\n{joined_text}"
+    """Detect CREDIT vs DEBIT on a NayaPay receipt, prioritizing explicit action verbs over memos."""
+    subj = subject or ""
+    combined = f"{subj}\n{joined_text}"
+    if _HERO_DEBIT_RE.search(subj) and not _HERO_CREDIT_RE.search(subj):
+        return "DEBIT"
+    if _HERO_CREDIT_RE.search(subj) and not _HERO_DEBIT_RE.search(subj):
+        return "CREDIT"
     if _HERO_CREDIT_RE.search(combined) and not _HERO_DEBIT_RE.search(combined):
         return "CREDIT"
-    if re.search(r"(?i)\brefund\b", combined) and not re.search(
-        r"(?i)\b(?:you\s+paid|money\s+sent|debited)\b", combined
+    if re.search(r"(?i)\brefund(?:ed)?\b", combined) and not re.search(
+        r"(?i)\b(?:you\s+(?:paid|sent|spent)|money\s+sent|debited)\b", combined
     ):
         return "CREDIT"
 
@@ -425,13 +444,13 @@ def _detect_nayapay_direction(subject: str, joined_text: str) -> TxType:
         return "CREDIT"
     if has_debit and not has_credit:
         return "DEBIT"
-    if _CREDIT_RE.search(subject or "") and not _HERO_DEBIT_RE.search(subject or ""):
+    if _CREDIT_RE.search(subj) and not _HERO_DEBIT_RE.search(subj):
         return "CREDIT"
     return "DEBIT"
 
 
 def _extract_nayapay_datetime(lines: list[str], fallback_date: str) -> tuple[str, str]:
-    """Extract normalized transaction date and timestamp from NayaPay lines."""
+    """Extract normalized PKT date and timestamp from NayaPay lines."""
     date_part = ""
     time_part = ""
     for ln in lines:
@@ -458,17 +477,27 @@ def _extract_nayapay_datetime(lines: list[str], fallback_date: str) -> tuple[str
     m_on = re.search(
         r"(?i)\bon\s+(\d{1,2}[-/ ](?:[A-Za-z]{3,9}|\d{1,2})[-/ ]\d{2,4}"
         r"(?:\s+(?:at\s+)?\d{1,2}:\d{2}(?::\d{2})?(?:\s*[APap][Mm])?)?|"
+        r"[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}"
+        r"(?:\s+(?:at\s+)?\d{1,2}:\d{2}(?::\d{2})?(?:\s*[APap][Mm])?)?|"
         r"\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}:\d{2})?)",
         joined,
     )
     if m_on:
         return normalize_datetime_str(m_on.group(1), fallback_date)
 
+    # Real NayaPay receipts embed "21 Nov 2026, 04:42 PM:" inline without "on "
+    m_bare_dt = re.search(
+        r"\b(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4},?\s+\d{1,2}:\d{2}(?::\d{2})?\s*[APap][Mm])\b",
+        joined,
+    )
+    if m_bare_dt:
+        return normalize_datetime_str(m_bare_dt.group(1), fallback_date)
+
     return normalize_datetime_str(fallback_date)
 
 
 def _extract_nayapay_channel(subject: str, joined_text: str) -> Optional[str]:
-    """Identify NayaPay payment channel (Card, Raast, Bill Payment, IBFT, Wallet)."""
+    """Identify NayaPay payment channel (ATM, Card, Raast, Bill Payment, IBFT, Wallet)."""
     combined = f"{subject or ''}\n{joined_text}"
     m_lbl = re.search(
         r"(?im)^(?:payment\s+(?:method|channel)|channel|transaction\s+type|mode)\s*[:\-]\s*(.+)$",
@@ -476,6 +505,8 @@ def _extract_nayapay_channel(subject: str, joined_text: str) -> Optional[str]:
     )
     probe = m_lbl.group(1) if m_lbl else combined
 
+    if re.search(r"(?i)\bcash\s+withdrawal\b|\batm\s+withdrawal\b", combined) and not _FAILED_FEE_PAID_RE.search(combined):
+        return "ATM"
     if re.search(r"(?i)\braast\b", probe) or re.search(r"(?i)\braast\b", combined):
         return "Raast"
     if re.search(
@@ -502,7 +533,8 @@ def _extract_nayapay_payee(
         else:
             expanded.append(ln)
     joined = "\n".join(expanded)
-    iban_match = _IBAN_RE.search(joined)
+    is_raast = bool(re.search(r"(?i)\braast\b", f"{subject or ''}\n{joined}"))
+    iban_match = _IBAN_RE.search(joined) if is_raast else None
     iban_str = iban_match.group(0).upper() if iban_match else None
 
     labels = _CREDIT_PAYEE_LABELS if direction == "CREDIT" else _DEBIT_PAYEE_LABELS
@@ -511,6 +543,8 @@ def _extract_nayapay_payee(
         m = pattern.search(joined)
         if m:
             val = _strip_trailing_emojis(m.group(1).strip())
+            if label.lower() in ("to", "from") and ("@" in val or "<" in val):
+                continue
             if (
                 val
                 and not _is_masked_identifier(val)
@@ -535,7 +569,7 @@ def _extract_nayapay_payee(
         m_paid = re.search(
             r"(?i)\b(?:you\s+(?:paid|spent|sent)|money\s+sent|sent|paid|spent)\s+"
             r"(?:PKR|Rs\.?|PK\s*Rs\.?)\s*[0-9][0-9,]*(?:\.[0-9]{1,2})?\s+"
-            r"(?:to|at)\s+([A-Za-z0-9 *&'.\-/()]{2,70}?)"
+            r"(?:to|at)\s+([A-Za-z0-9 *&'.\-/()@_,]{2,70}?)"
             r"(?:\s+on\s+\d|\s+via\s+|\s+using\s+|\s+with\s+|\n|\.(?=\s|$)|$)",
             clean_probe,
         )
@@ -552,7 +586,7 @@ def _extract_nayapay_payee(
         m_rec = re.search(
             r"(?i)\b(?:money\s+received|you\s+(?:received|got)|received|got)\s+"
             r"(?:PKR|Rs\.?|PK\s*Rs\.?)\s*[0-9][0-9,]*(?:\.[0-9]{1,2})?\s+"
-            r"from\s+([A-Za-z0-9 *&'.\-/()]{2,70}?)"
+            r"from\s+([A-Za-z0-9 *&'.\-/()@_,]{2,70}?)"
             r"(?:\s+on\s+\d|\s+via\s+|\n|\.(?=\s|$)|$)",
             clean_probe,
         )
@@ -603,33 +637,68 @@ def parse_nayapay_email(
     if is_ignored_nayapay_email(subject, body):
         return None
 
-    lines = _nayapay_html_to_lines(body)
+    structured = html_to_structured_text(body)
+    cleaned_fwd, forwarded_sent, forwarded_subject = _extract_outlook_forward_meta(structured)
+    lines = [ln for ln in cleaned_fwd.splitlines() if ln]
     joined_text = "\n".join(lines)
+    eff_subject = (
+        forwarded_subject
+        if forwarded_subject and (not subject or re.match(r"(?i)^fwd?\s*:", subject.strip()))
+        else subject
+    )
+    eff_fallback = forwarded_sent or fallback_date
 
-    amount, tax_fee_amount = _extract_amounts_and_taxes(lines, subject)
+    # Require positive completed transaction cue (block promos/limit-notices without confirmation)
+    if not _FAILED_FEE_PAID_RE.search(f"{eff_subject or ''}\n{joined_text}") and not re.search(
+        r"(?:\b(?:you\s+(?:paid|spent|sent|received|got)|money\s+(?:sent|received)|"
+        r"has\s+been\s+(?:debited|credited)|was\s+successful|cash\s+withdrawal|"
+        r"subscribed\s+to|topped\s+up|bill\s+payment|refund(?:ed)?|revers(?:al|ed)|"
+        r"card\s+transaction|transaction\s+receipt|card\s+fee\s+receipt|"
+        r"transaction\s+amount|total\s+amount|base\s+amount|total\s+charged|"
+        r"amount\s+charged|amount\s+paid|paid\s+to)\b|"
+        r"^(?:merchant\s+name|beneficiary\s+name|sender\s+name|card\s+fee)\s*:)",
+        f"{eff_subject or ''}\n{joined_text}",
+        flags=re.IGNORECASE | re.MULTILINE,
+    ):
+        return None
+
+    amount, tax_fee_amount = _extract_amounts_and_taxes(lines, eff_subject)
     if amount is None or amount <= 0.0:
         return None
 
-    direction = _detect_nayapay_direction(subject, joined_text)
-    tx_date, tx_timestamp = _extract_nayapay_datetime(lines, fallback_date)
-    payment_channel = _extract_nayapay_channel(subject, joined_text)
-    payee, notes = _extract_nayapay_payee(lines, subject, direction)
+    direction = _detect_nayapay_direction(eff_subject, joined_text)
+    tx_date, tx_timestamp = _extract_nayapay_datetime(lines, eff_fallback)
+    payment_channel = _extract_nayapay_channel(eff_subject, joined_text)
+    payee, notes = _extract_nayapay_payee(lines, eff_subject, direction)
 
+    suggested_category: Optional[str] = None
     suggested_bucket: Optional[CostBucket] = "INFLOW" if direction == "CREDIT" else None
+    tx_type_out: TxType = direction
+    target_account: Optional[str] = None
+
+    if direction == "DEBIT" and _FAILED_FEE_PAID_RE.search(f"{eff_subject or ''}\n{joined_text}"):
+        suggested_category = "Bank & Tax Friction"
+        suggested_bucket = "LEAKAGE"
+    elif direction == "DEBIT" and payment_channel == "ATM":
+        tx_type_out = "TRANSFER_INTERNAL"
+        target_account = WALLET_CASH
+        suggested_category = "Cash Withdrawal"
+        suggested_bucket = "IGNORE"
 
     return ParsedTransaction(
         message_id=message_id,
         tx_date=tx_date,
         tx_timestamp=tx_timestamp,
         account_name=WALLET_NAYAPAY,
-        target_account=None,
-        tx_type=direction,
+        target_account=target_account,
+        tx_type=tx_type_out,
         amount=amount,
         tax_fee_amount=tax_fee_amount,
         payee=payee,
         source="GMAIL_NAYAPAY",
         payment_channel=payment_channel,
-        raw_subject=subject.strip() if subject and subject.strip() else None,
+        raw_subject=eff_subject.strip() if eff_subject and eff_subject.strip() else None,
         notes=notes,
+        suggested_category=suggested_category,
         suggested_bucket=suggested_bucket,
     )

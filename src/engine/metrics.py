@@ -47,7 +47,8 @@ def _compute_burn_breakdown(
     non_envelope_variable = 0.0
     actual_leakage_base = 0.0
     total_tax_fees = 0.0
-    monthly_mmf_swept = 0.0
+    gross_mmf_swept = 0.0
+    mmf_redemptions = 0.0
     envelope_topups = 0.0
     envelope_returns = 0.0
     topup_events: list[tuple[int, float]] = []
@@ -63,13 +64,17 @@ def _compute_burn_breakdown(
             continue
 
         if tx_type == "TRANSFER_MMF":
-            monthly_mmf_swept += tx.amount
+            gross_mmf_swept += tx.amount
+            if envelope_mode and tx.account_name == WALLET_NAYAPAY:
+                envelope_returns += tx.amount + tx.tax_fee_amount
             if tx.tax_fee_amount > 0:
                 total_tax_fees += tx.tax_fee_amount
                 daily_burn[day] += tx.tax_fee_amount
             continue
 
         if tx_type == "TRANSFER_INTERNAL":
+            if tx.account_name == WALLET_MMF:
+                mmf_redemptions += tx.amount
             if envelope_mode and tx.target_account == WALLET_NAYAPAY:
                 envelope_topups += tx.amount
                 topup_events.append((day, tx.amount))
@@ -80,7 +85,7 @@ def _compute_burn_breakdown(
                 and tx.account_name == WALLET_NAYAPAY
                 and tx.target_account in (WALLET_HABIBMETRO, WALLET_CASH)
             ):
-                envelope_returns += tx.amount
+                envelope_returns += tx.amount + tx.tax_fee_amount
                 if tx.tax_fee_amount > 0:
                     total_tax_fees += tx.tax_fee_amount
                     daily_burn[day] += tx.tax_fee_amount
@@ -127,6 +132,7 @@ def _compute_burn_breakdown(
     actual_variable = round(actual_variable, 2)
     total_tax_fees = round(total_tax_fees, 2)
     total_monthly_burn = round(actual_fixed + actual_variable + actual_leakage, 2)
+    monthly_mmf_swept = round(max(0.0, gross_mmf_swept - mmf_redemptions), 2)
 
     return {
         "actual_inflow": round(actual_inflow, 2),
@@ -135,7 +141,7 @@ def _compute_burn_breakdown(
         "actual_leakage_burn": actual_leakage,
         "total_tax_fees": total_tax_fees,
         "total_monthly_burn": total_monthly_burn,
-        "monthly_mmf_swept": round(monthly_mmf_swept, 2),
+        "monthly_mmf_swept": monthly_mmf_swept,
         "daily_burn": daily_burn,
     }
 
@@ -155,6 +161,7 @@ def compute_dashboard_metrics(
 ) -> DashboardMetrics:
     """Compute all Month 1 Financial Defense equations and Batwa analytics for a month."""
     year, month = _parse_month_key(month_key)
+    norm_month_key = f"{year:04d}-{month:02d}"
     ref_date = reference_date or date.today()
     days_in_month = calendar.monthrange(year, month)[1]
 
@@ -169,11 +176,16 @@ def compute_dashboard_metrics(
         days_remaining = days_in_month
 
     config = db.get_budget_config()
-    month_txs = db.get_transactions(month_key=month_key)
-    upcoming_bills = sync_recurring_status(db, month_key, reference_date=ref_date)
+    month_txs = db.get_transactions(month_key=norm_month_key)
+    upcoming_bills = sync_recurring_status(
+        db,
+        norm_month_key,
+        reference_date=ref_date,
+        persist_flags=(norm_month_key == ref_date.strftime("%Y-%m")),
+    )
     unpaid_bills_total = round(
         sum(
-            status.commitment.expected_amount
+            max(0.0, status.commitment.expected_amount - status.paid_amount)
             for status in upcoming_bills
             if not status.is_paid
         ),
@@ -201,23 +213,36 @@ def compute_dashboard_metrics(
         )
     else:
         burn_utilization_pct = 100.0 if total_monthly_burn > 0 else 0.0
-    safe_daily_spend = round(
-        max(0.0, remaining_allowance / max(1, days_remaining)), 2
+    safe_daily_spend = (
+        round(max(0.0, remaining_allowance / days_remaining), 2)
+        if days_remaining > 0
+        else 0.0
     )
     actual_daily_burn_pace = (
-        round(total_monthly_burn / max(1, days_elapsed), 2)
-        if (days_elapsed > 0 or total_monthly_burn > 0)
+        round(total_monthly_burn / days_elapsed, 2)
+        if days_elapsed > 0
         else 0.0
     )
 
     # Month-over-Month daily burn pace
     prev_key, prev_year, prev_month = _previous_month_key(year, month)
-    prev_txs = db.get_transactions(month_key=prev_key)
-    prev_burn = _compute_burn_breakdown(prev_txs, config.envelope_mode)
     prev_days_in_month = calendar.monthrange(prev_year, prev_month)[1]
-    prev_month_daily_burn_pace = round(
-        float(prev_burn["total_monthly_burn"]) / prev_days_in_month, 2
-    )
+    if (prev_year, prev_month) == (ref_date.year, ref_date.month):
+        prev_days_elapsed = min(max(ref_date.day, 1), prev_days_in_month)
+    elif (prev_year, prev_month) < (ref_date.year, ref_date.month):
+        prev_days_elapsed = prev_days_in_month
+    else:
+        prev_days_elapsed = 0
+
+    if days_elapsed > 0 and prev_days_elapsed > 0:
+        prev_txs = db.get_transactions(month_key=prev_key)
+        prev_burn = _compute_burn_breakdown(prev_txs, config.envelope_mode)
+        prev_month_daily_burn_pace = round(
+            float(prev_burn["total_monthly_burn"]) / prev_days_elapsed, 2
+        )
+    else:
+        prev_month_daily_burn_pace = 0.0
+
     mom_pace_delta_pct = (
         round(
             (
@@ -227,7 +252,7 @@ def compute_dashboard_metrics(
             * 100.0,
             2,
         )
-        if prev_month_daily_burn_pace > 0
+        if (days_elapsed > 0 and prev_month_daily_burn_pace > 0)
         else 0.0
     )
 
@@ -241,20 +266,29 @@ def compute_dashboard_metrics(
         config.fixed_cost_baseline * config.emergency_multiplier, 2
     )
     emergency_progress_pct = (
-        round((emergency_current / emergency_target) * 100.0, 2)
+        round(max(0.0, (emergency_current / emergency_target) * 100.0), 2)
         if emergency_target > 0
         else 0.0
     )
 
-    effective_income = (
-        max(config.monthly_income, actual_inflow)
-        if config.monthly_income > 0
-        else actual_inflow
-    )
-    allocated_or_spent = max(total_spending_cap, total_monthly_burn)
-    unallocated_cash_surplus = round(
-        max(0.0, effective_income - allocated_or_spent - monthly_mmf_swept), 2
-    )
+    if days_remaining == 0:
+        # Closed past month: use realized inflow minus actual spend & MMF sweeps
+        unallocated_cash_surplus = round(
+            max(0.0, actual_inflow - total_monthly_burn - monthly_mmf_swept), 2
+        )
+    elif days_elapsed == 0 or (actual_inflow == 0 and total_monthly_burn == 0 and monthly_mmf_swept == 0):
+        # Future or completely empty unstarted month: don't report phantom target surplus
+        unallocated_cash_surplus = 0.0
+    else:
+        effective_income = (
+            max(config.monthly_income, actual_inflow)
+            if config.monthly_income > 0
+            else actual_inflow
+        )
+        allocated_or_spent = max(total_spending_cap, total_monthly_burn)
+        unallocated_cash_surplus = round(
+            max(0.0, effective_income - allocated_or_spent - monthly_mmf_swept), 2
+        )
 
     total_liquid_balance = round(
         sum(
@@ -272,8 +306,11 @@ def compute_dashboard_metrics(
     merchant_totals: dict[str, float] = defaultdict(float)
     merchant_counts: dict[str, int] = defaultdict(int)
     merchant_cats: dict[str, Counter[str]] = defaultdict(Counter)
+    granular_tax_fees = 0.0
 
     for tx in month_txs:
+        if tx.tx_type != "CREDIT":
+            granular_tax_fees += tx.tax_fee_amount
         if tx.tx_type != "DEBIT":
             continue
         if tx.cost_bucket not in ("FIXED", "VARIABLE", "LEAKAGE"):
@@ -284,20 +321,25 @@ def compute_dashboard_metrics(
         merchant_counts[merchant_name] += 1
         merchant_cats[merchant_name][tx.category] += 1
 
-    if total_tax_fees > 0:
-        category_spend["Bank & Tax Friction"] += total_tax_fees
+    all_budgets = db.get_category_budgets(active_only=False)
+    leakage_cat = next(
+        (cb.category for cb in all_budgets if cb.is_active and cb.cost_bucket == "LEAKAGE"),
+        "Bank & Tax Friction",
+    )
+    if granular_tax_fees > 0:
+        category_spend[leakage_cat] += round(granular_tax_fees, 2)
 
+    budget_by_name = {cb.category: cb for cb in all_budgets}
     category_progress: list[CategoryProgress] = []
-    for cb in db.get_category_budgets(active_only=True):
-        if cb.cost_bucket not in ("FIXED", "VARIABLE", "LEAKAGE"):
+    emitted_cats: set[str] = set()
+    for cb in all_budgets:
+        if not cb.is_active or cb.cost_bucket not in ("FIXED", "VARIABLE", "LEAKAGE"):
             continue
+        emitted_cats.add(cb.category)
         spent = round(category_spend.get(cb.category, 0.0), 2)
         limit = round(cb.monthly_limit, 2)
-        remaining = round(limit - spent, 2)
-        if limit > 0:
-            utilization_pct = round((spent / limit) * 100.0, 2)
-        else:
-            utilization_pct = 100.0 if spent > 0 else 0.0
+        remaining = round(limit - spent, 2) if limit > 0 else 0.0
+        utilization_pct = round((spent / limit) * 100.0, 2) if limit > 0 else 0.0
         category_progress.append(
             CategoryProgress(
                 category=cb.category,
@@ -307,11 +349,34 @@ def compute_dashboard_metrics(
                 monthly_limit=limit,
                 remaining=remaining,
                 utilization_pct=utilization_pct,
-                status_color=_status_color(utilization_pct),
+                status_color=_status_color(utilization_pct) if limit > 0 else "green",
             )
         )
+
+    for cat_name, raw_spent in category_spend.items():
+        if cat_name in emitted_cats or raw_spent <= 0:
+            continue
+        spent = round(raw_spent, 2)
+        meta = budget_by_name.get(cat_name)
+        bucket = meta.cost_bucket if meta and meta.cost_bucket in ("FIXED", "VARIABLE", "LEAKAGE") else "VARIABLE"
+        limit = round(meta.monthly_limit, 2) if meta else 0.0
+        remaining = round(limit - spent, 2) if limit > 0 else 0.0
+        util = round((spent / limit) * 100.0, 2) if limit > 0 else 0.0
+        category_progress.append(
+            CategoryProgress(
+                category=cat_name,
+                emoji=meta.emoji if meta else "📦",
+                cost_bucket=bucket,
+                spent=spent,
+                monthly_limit=limit,
+                remaining=remaining,
+                utilization_pct=util,
+                status_color=_status_color(util) if limit > 0 else "green",
+            )
+        )
+
     category_progress.sort(
-        key=lambda cp: (-cp.utilization_pct, -cp.spent, cp.category)
+        key=lambda cp: (0 if cp.monthly_limit > 0 else 1, -cp.utilization_pct, -cp.spent, cp.category)
     )
 
     top_merchants = [
@@ -335,14 +400,14 @@ def compute_dashboard_metrics(
         daily_cumulative_spend.append(
             DailyBurnPoint(
                 day=day,
-                tx_date=f"{month_key}-{day:02d}",
+                tx_date=f"{norm_month_key}-{day:02d}",
                 daily_spend=d_spend,
                 cumulative_spend=running_total,
             )
         )
 
     return DashboardMetrics(
-        month_key=month_key,
+        month_key=norm_month_key,
         monthly_income=round(config.monthly_income, 2),
         actual_inflow=actual_inflow,
         fixed_cost_baseline=round(config.fixed_cost_baseline, 2),

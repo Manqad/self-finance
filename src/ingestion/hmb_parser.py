@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import html
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from bs4 import BeautifulSoup
@@ -26,10 +26,12 @@ _HTML_TAG_RE = re.compile(
     re.IGNORECASE,
 )
 
+_PKT_TZ = timezone(timedelta(hours=5))
+
 _DISCLAIMER_SENT_RE = re.compile(
-    r"(?i)\b(?:(?:will\s+)?never\s+asks?|do(?:es)?\s+not\s+asks?|"
-    r"don'?t\s+(?:share|ask)|doesn'?t\s+ask|"
-    r"do\s+not\s+share|never\s+shares?|never\s+calls?|never\s+requests?)\b"
+    r"(?i)\b(?:(?:will\s+)?never\s+(?:asks?|disclose|reveal|give|provide|shares?|calls?|requests?)|"
+    r"do(?:es)?\s+not\s+(?:asks?|disclose|share)|don'?t\s+(?:share|ask|disclose)|doesn'?t\s+ask|"
+    r"keep\s+[^.\n]{0,40}\bconfidential\b|protect\s+your\s+(?:otp|pin|passcode)|beware\s+of)\b"
 )
 _SENTENCE_SPLIT_RE = re.compile(
     r"(?<!\be\.g)(?<!\bi\.e)(?<!\bRs)(?<=[.!?])\s+",
@@ -38,23 +40,33 @@ _SENTENCE_SPLIT_RE = re.compile(
 
 _IGNORED_OTP_RE = re.compile(
     r"(?i)\b(?:otp|one[\s\-]+time[\s\-]+password|verification\s+code|passcode|"
-    r"login\s+(?:attempt|alert)|security\s+alert)\b"
+    r"login\s+(?:attempt|alert)|security\s+alert|mpin\s+(?:reset|change)|password\s+reset)\b"
+)
+_IGNORED_PROMO_RE = re.compile(
+    r"(?i)(?:\bupgrade\s+your\s+[^.\n]{0,40}\blimit\b|"
+    r"\blimit\s+(?:up\s+to|is\s+now|has\s+been\s+increased|used)\b|"
+    r"\b(?:spend|pay)\s+(?:rs\.?|pkr)\s*[0-9,.]+\s+and\s+get\b|"
+    r"\b(?:cashback|discount)\s+offer\b|\bschedule\s+of\s+charges\b|"
+    r"\be-?statement\s+(?:is\s+ready|for\s+the\s+month)\b)"
 )
 _IGNORED_STATUS_RE = re.compile(
-    r"(?i)\b(declined|failed|unsuccessful|insufficient|rejected|cancell?ed)\b"
+    r"(?i)\b(declined|failed|unsuccessful|insufficient|rejected|cancell?ed|expired|timed?\s*out)\b"
 )
 _CONFIRMED_TX_OR_REFUND_RE = re.compile(
-    r"(?i)\b(?:has\s+been\s+debited|has\s+been\s+credited|available\s+balance|"
-    r"refund(?:ed)?|reversed)\b"
+    r"(?i)\b(?:has\s+been\s+debited|has\s+been\s+credited|was\s+successful|"
+    r"refund(?:ed)?|revers(?:al|ed))\b"
 )
 _EXPLICIT_TX_FAILURE_RE = re.compile(
     r"(?i)\b(?:transaction\s+(?:(?:was|has\s+been|is)\s+)?(?:declined|failed|unsuccessful|rejected|cancell?ed)|"
     r"payment\s+(?:(?:was|has\s+been|is)\s+)?(?:declined|failed|unsuccessful|rejected|cancell?ed)|"
+    r"insufficient\s+funds|exceeds?\s+[^.\n]{0,30}balance|"
     r"(?:was|is)\s+(?:declined|failed|unsuccessful|rejected))\b"
 )
 _REFUND_CREDIT_CONFIRMED_RE = re.compile(
     r"(?i)(?:\b(?:has\s+been\s+)?credited\b[^.\n]{0,60}\b(?:refund(?:ed)?|reversal|reversed)\b"
     r"|\b(?:refund(?:ed)?|reversal|reversed)\b[^.\n]{0,60}\b(?:has\s+been\s+)?credited\b"
+    r"|\brefund(?:ed)?\s+(?:of|processed|issued|received|credited)\b"
+    r"|\breversal\s+of\b"
     r"|\b(?:credited\s+as\s+(?:a\s+)?refund|reversed\s+(?:to|into)\s+your\s+account)\b)"
 )
 
@@ -62,11 +74,12 @@ _HMB_TRIGGER_RE = re.compile(
     r"(?i)(habib\s*metro|habibmetro|eservice@habibmetro)"
 )
 _HMB_INNER_FROM_RE = re.compile(
-    r"(?im)^from\s*:\s*[^\n]*(?:habib\s*metro|habibmetro|eservice@habibmetro)"
+    r"(?im)^from\s*:\s*[^\n]*(?:(?:@|<[^>\n]+>)[^\n]*(?:habib\s*metro|habibmetro)|"
+    r"(?:habib\s*metro|habibmetro)[^\n]*(?:@|<[^>\n]+>)|eservice@habibmetro)"
 )
 _NAYAPAY_SENDER_RE = re.compile(r"(?i)nayapay\.com|\bnayapay\b")
 _NAYAPAY_ORIGIN_RE = re.compile(
-    r"(?im)(?:^from\s*:\s*[^\n]*\bnaya\s*pay\b|"
+    r"(?im)(?:^from\s*:\s*[^\n]*(?:service@nayapay|nayapay\.com|naya\s*pay[^\n]*(?:@|<[^>\n]+>))|"
     r"\b(?:via\s+nayapay|using\s+(?:your\s+)?nayapay|"
     r"nayapay(?:\s+[a-z]+){0,3}\s+receipt)\b)"
 )
@@ -76,11 +89,11 @@ _OUTLOOK_DIVIDER_RE = re.compile(
     re.IGNORECASE,
 )
 _EMAIL_HEADER_LINE_RE = re.compile(
-    r"^\s*(From|Sent|Date|To|Cc|Bcc|Subject|Reply-To)\s*:\s*(.*)$",
+    r"^\s*(From|Sent|Date|To|Cc|Bcc|Subject|Reply-To|Importance|Sensitivity|Attachments?)\s*:\s*(.*)$",
     re.IGNORECASE,
 )
 _EMAIL_SIG_RE = re.compile(r"@|<[^>\n]+>")
-_ISO_DATE_PREFIX_RE = re.compile(r"^\s*\d{4}[-/]\d{1,2}[-/]\d{1,2}\b")
+_ISO_DATE_PREFIX_RE = re.compile(r"^\s*\d{4}[-/]\d{1,2}[-/]\d{1,2}(?![0-9])")
 
 _BAL_QUALIFIER = (
     r"(?:account|acct\.?|a/c|avail\.?|available|avl\.?|closing|opening|"
@@ -90,12 +103,14 @@ _BALANCE_LINE_RE = re.compile(
     rf"(?i)^\s*(?:{_BAL_QUALIFIER}\s+)?bal(?:ance)?\.?\s*[:\-]"
 )
 _BALANCE_PHRASE_RE = re.compile(
-    rf"(?i)(?:(?:\byour\s+)?(?:{_BAL_QUALIFIER}\s+)?|\byour\s+)"
-    rf"bal(?:ance)?\.?\s*(?:is|of|:|-)?\s*(?:PKR|Rs\.?|PK\s*Rs\.?)?\s*[0-9][0-9,]*(?:\.[0-9]{{1,2}})?"
+    rf"(?:\b(?:{_BAL_QUALIFIER})\s+|\byour\s+)"
+    rf"bal(?:ance)?\.?(?:\s+after\s+transaction)?\s*(?:is|of|:|-)?\s*(?:PKR|Rs\.?|PK\s*Rs\.?)?\s*[0-9][0-9,]*(?:\.[0-9]{{1,2}})?|"
+    r"\bbalance\s+after\s+transaction\s*(?:is|of|:|-)?\s*(?:PKR|Rs\.?|PK\s*Rs\.?)?\s*[0-9][0-9,]*(?:\.[0-9]{1,2})?",
+    re.IGNORECASE,
 )
 
 _LABELED_AMOUNT_RE = re.compile(
-    r"(?i)\b(?:transaction\s+amount|tx\s+amount|debited\s+amount|credited\s+amount|"
+    r"(?im)^\s*(?:transaction\s+amount|tx\s+amount|debited\s+amount|credited\s+amount|"
     r"transfer\s+amount|withdrawal\s+amount|bill\s+amount|amount)\b\s*[:\-]\s*"
     r"(?:PKR|Rs\.?|PK\s*Rs\.?)?\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)"
 )
@@ -106,9 +121,9 @@ _CURRENCY_AFTER_RE = re.compile(
     r"(?i)\b([0-9][0-9,]*(?:\.[0-9]{1,2})?)\s*(?:PKR|Rs\.?)\b"
 )
 _FEE_LINE_RE = re.compile(
-    r"(?i)\b(?:fee|charges|fed|wht|tax|commission|surcharge)\b"
-    r"(?:\s*\([^)\n]{1,20}\))?\s*[:\-]\s*"
-    r"(?:PKR|Rs\.?|PK\s*Rs\.?)?\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)"
+    r"(?im)^(?:[^\n:]{0,40}\b(?:fee|charges|fed|wht|tax|commission|surcharge)\b"
+    r"(?:\s*\((?!\s*(?:ntn|strn|id|no|ref|code)\s*\))[^)\n]{1,20}\))?\s*[:\-]\s*"
+    r"(?:PKR|Rs\.?|PK\s*Rs\.?)\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?))"
 )
 _FEE_LINE_STRIP_RE = re.compile(
     r"(?im)^(?:[^\n:]{0,40}\b(?:fee|charges|fed|wht|tax|commission|surcharge)\b"
@@ -116,12 +131,12 @@ _FEE_LINE_STRIP_RE = re.compile(
     r"[^\n]*(?:schedule\s+of\s+charges|\bmay\s+apply\b|\bas\s+applicable\b)[^\n]*)$"
 )
 _HMB_FEE_TAX_RE = re.compile(
-    r"(?i)\b(?:fee|charges|wht|withholding|fed|excise|tax|annual\s+fee|"
-    r"card\s+fee|sms\s+(?:alert\s+)?(?:fee|charges))\b"
+    r"(?i)(?:\bwht\b|\bwithholding(?:\s+tax)?\b|\bfed\b|\bfederal\s+excise\b|\bfbr\s+tax\b|"
+    r"\b(?:bank|service|sms(?:\s+alert)?|annual|card|atm|ibft|fx|foreign|surcharge|processing)\s+(?:fee|charges)\b)"
 )
 _HMB_FEE_NARRATIVE_RE = re.compile(
     r"(?i)\b(?:debited(?:\s+(?:with|for|from|by))?\s+(?:[^\n.]|\.(?=\d)){0,90}"
-    r"\b(?:fee|charges|wht|withholding|fed|excise|tax)\b|"
+    r"\b(?:bank\s+charges|service\s+charges|sms\s+fee|annual\s+fee|card\s+fee|wht|withholding\s+tax|fed|excise)\b|"
     r"(?:annual|card)\s+fee|sms\s+(?:alert\s+)?(?:fee|charges)|"
     r"(?:wht|withholding\s+tax|fed|excise)\s+(?:on|for|deducted))\b"
 )
@@ -130,7 +145,7 @@ _CREDIT_STRONG_RE = re.compile(
     r"(?i)\b(?:has\s+been\s+credited|credited\s+(?:to|with)|credit\s+alert|"
     r"amount\s+received|money\s+received|received\s+(?:from|in|via)|"
     r"inward\s+(?:ibft|raast|remittance|transfer)|deposited|deposit\s+alert|"
-    r"salary\s+credited|refund(?:ed)?)\b"
+    r"salary\s+credited|refund(?:ed)?|revers(?:al|ed))\b"
 )
 _DEBIT_STRONG_RE = re.compile(
     r"(?i)\b(?:has\s+been\s+debited|debited\s+(?:from|with|by)|debit\s+alert|"
@@ -158,9 +173,8 @@ _CASH_WITHDRAWAL_RE = re.compile(
     r"(?i)\b(?:cash\s+withdrawal|atm\s+withdrawal|atm\s+cash)\b"
 )
 _CARD_POS_CONTEXT_RE = re.compile(
-    r"(?i)(?:\bpos\b|\bdebit\s+card\b|\bmastercard\b|\bvisa\b|\bpaypak\b|"
-    r"\b(?:atm\s*/\s*debit|atm)\s+card\b(?=.{0,80}\b(?:at|pos|purchase|used\s+for|merchant)\b)|"
-    r"\bpurchase\s+at\b|\bwas\s+used\s+for\b.{0,40}\bat\b)"
+    r"(?i)(?:\bpos\b|\bpurchase\s+at\b|\bwas\s+used\s+for\b.{0,40}\bat\b|"
+    r"(?:debit\s+card|mastercard|visa|paypak)\b(?![^\n]{0,80}\bat\s+[A-Za-z0-9 *&'.\-/]{0,40}\batm\b))"
 )
 _ATM_RE = re.compile(
     r"(?i)\b(?:cash\s+withdrawal|atm\s+withdrawal|atm(?!\s*(?:/\s*debit)?\s*card\b))\b"
@@ -178,6 +192,8 @@ _TIME_LABEL_RE = re.compile(
 )
 _INLINE_ON_DATE_RE = re.compile(
     r"(?i)\bon\s+(\d{1,2}[-/ ](?:[A-Za-z]{3,9}|\d{1,2})[-/ ]\d{2,4}"
+    r"(?:\s+(?:at\s+)?\d{1,2}:\d{2}(?::\d{2})?(?:\s*[APap][Mm])?)?|"
+    r"[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}"
     r"(?:\s+(?:at\s+)?\d{1,2}:\d{2}(?::\d{2})?(?:\s*[APap][Mm])?)?|"
     r"\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}:\d{2})?)"
 )
@@ -225,19 +241,34 @@ def parse_amount_value(raw_num: str) -> Optional[float]:
 
 
 def normalize_datetime_str(
-    raw_dt: str, fallback_date: str = ""
+    raw_dt: str,
+    fallback_date: str = "",
+    *,
+    allow_now_fallback: bool = True,
+    dayfirst_hint: Optional[bool] = None,
 ) -> tuple[str, str]:
-    """Parse an arbitrary date/time string into (YYYY-MM-DD, YYYY-MM-DD HH:MM:SS)."""
+    """Parse date/time string into PKT (YYYY-MM-DD, YYYY-MM-DD HH:MM:SS), converting aware TZ offsets."""
     for candidate in (raw_dt, fallback_date):
         text = (candidate or "").strip()
         if not text:
             continue
-        # Strip noisy suffixes like "PKT" or "(GMT+5)" that can trip strict parsers
         cleaned = re.sub(r"\bPKT\b", "+0500", text, flags=re.IGNORECASE).strip()
+        cleaned = re.sub(
+            r"\(?\s*(?:GMT|UTC)\s*([+-]\d{1,2})(?::?(\d{2}))?\s*\)?",
+            lambda m: f"{int(m.group(1)):+03d}{m.group(2) or '00'}",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
         cleaned = re.sub(r"\s+at\s+", " ", cleaned, flags=re.IGNORECASE)
-        dayfirst = not bool(_ISO_DATE_PREFIX_RE.match(cleaned))
+        dayfirst = (
+            dayfirst_hint
+            if dayfirst_hint is not None
+            else (not bool(_ISO_DATE_PREFIX_RE.match(cleaned)))
+        )
         try:
-            dt = date_parser.parse(cleaned, dayfirst=dayfirst, fuzzy=True)
+            dt = date_parser.parse(cleaned, dayfirst=dayfirst, fuzzy=allow_now_fallback)
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(_PKT_TZ).replace(tzinfo=None)
             has_time = bool(re.search(r"\d{1,2}:\d{2}", cleaned))
             date_str = dt.strftime("%Y-%m-%d")
             ts_str = (
@@ -249,7 +280,9 @@ def normalize_datetime_str(
         except (ValueError, OverflowError, TypeError):
             continue
 
-    now = datetime.now()
+    if not allow_now_fallback:
+        raise ValueError(f"Unparseable date/timestamp string: {raw_dt!r}")
+    now = datetime.now(_PKT_TZ).replace(tzinfo=None)
     date_str = now.strftime("%Y-%m-%d")
     return date_str, now.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -271,9 +304,11 @@ def strip_security_disclaimers(text: str) -> str:
 
 
 def is_ignored_bank_alert(combined_text: str) -> bool:
-    """Return True for OTP/login alerts or non-refund declined/failed/insufficient alerts."""
+    """Return True for OTP/login/promo/limit alerts or non-refund declined/failed alerts."""
     stripped = strip_security_disclaimers(combined_text)
     if _IGNORED_OTP_RE.search(stripped):
+        return True
+    if _IGNORED_PROMO_RE.search(stripped) and not _CONFIRMED_TX_OR_REFUND_RE.search(stripped):
         return True
     if _IGNORED_STATUS_RE.search(stripped):
         if _REFUND_CREDIT_CONFIRMED_RE.search(stripped):
@@ -505,6 +540,9 @@ def is_hmb_email(subject: str, sender: str, body: str) -> bool:
     """Detect HabibMetro / Habib Metro E-Service / HABIBMETRO transaction alerts."""
     sender_l = (sender or "").lower()
     subject_l = (subject or "").lower()
+    if _NAYAPAY_SENDER_RE.search(sender_l) and not _HMB_TRIGGER_RE.search(sender_l):
+        return False
+
     raw_text = html_to_structured_text(body)
 
     hmb_is_sender_or_inner_from = bool(
@@ -512,7 +550,7 @@ def is_hmb_email(subject: str, sender: str, body: str) -> bool:
     )
     if not hmb_is_sender_or_inner_from:
         combined_probe = f"{subject or ''}\n{raw_text}"
-        if _NAYAPAY_SENDER_RE.search(sender_l) or _NAYAPAY_ORIGIN_RE.search(combined_probe):
+        if _NAYAPAY_ORIGIN_RE.search(combined_probe):
             return False
 
     return bool(
@@ -526,6 +564,10 @@ def _is_card_pos_purchase(text: str) -> bool:
     """Return True if text reflects a card POS/online purchase rather than cash withdrawal."""
     if _CASH_WITHDRAWAL_RE.search(text) and not re.search(
         r"(?i)\b(?:pos|purchase\s+at)\b", text
+    ):
+        return False
+    if re.search(r"(?i)\batm\b(?!\s*(?:/\s*debit)?\s*card\b)", text) and not re.search(
+        r"(?i)\b(?:pos|purchase)\b", text
     ):
         return False
     return bool(_CARD_POS_CONTEXT_RE.search(text))
@@ -551,9 +593,9 @@ def classify_hmb_transfer(
             payment_channel,
         )
 
-    # 2. HabibMetro -> NayaPay internal wallet top-up
+    # 2. HabibMetro -> NayaPay internal wallet top-up (require NayaPay in payee/IBFT-to line, not third-party bank name)
     if _NAYAPAY_RE.search(payee_u) or re.search(
-        r"(?i)(?:to\s+account(?:\s+title)?|beneficiary|bank(?:\s+name)?|ibft\s+to|transfer\s+to)"
+        r"(?i)(?:to\s+account(?:\s+title)?|ibft\s+to|transfer\s+to)"
         r"[^\n]{0,60}\bnaya\s*pay\b|PK\d{2}NAYA[A-Z0-9]+",
         combined,
     ):
@@ -685,14 +727,15 @@ def _detect_hmb_direction(subject: str, cleaned_body: str) -> TxType:
 def _extract_hmb_datetime(
     cleaned_body: str, forwarded_sent: str, fallback_date: str
 ) -> tuple[str, str]:
-    """Extract normalized date and timestamp from body fields, inline phrases, or fallback."""
+    """Extract normalized PKT date/timestamp, preferring body fields then forwarded_sent then fallback_date."""
     date_part = ""
     time_part = ""
+    fb_chain = forwarded_sent or fallback_date
 
     for line in cleaned_body.splitlines():
         m_dt = _DATE_TIME_LABEL_RE.match(line)
         if m_dt:
-            return normalize_datetime_str(m_dt.group(1), fallback_date or forwarded_sent)
+            return normalize_datetime_str(m_dt.group(1), fb_chain)
         if not date_part:
             m_d = _DATE_LABEL_RE.match(line)
             if m_d:
@@ -704,13 +747,13 @@ def _extract_hmb_datetime(
 
     if date_part:
         combined_dt = f"{date_part} {time_part}".strip() if time_part else date_part
-        return normalize_datetime_str(combined_dt, fallback_date or forwarded_sent)
+        return normalize_datetime_str(combined_dt, fb_chain)
 
     m_inline = _INLINE_ON_DATE_RE.search(cleaned_body)
     if m_inline:
-        return normalize_datetime_str(m_inline.group(1), fallback_date or forwarded_sent)
+        return normalize_datetime_str(m_inline.group(1), fb_chain)
 
-    return normalize_datetime_str(fallback_date or forwarded_sent)
+    return normalize_datetime_str(forwarded_sent, fallback_date)
 
 
 def _extract_hmb_channel(subject: str, cleaned_body: str) -> Optional[str]:
@@ -777,18 +820,17 @@ def _extract_hmb_payee(
         r"(?i)\b(?:(?:used\s+for|debit(?:ed)?\s+(?:of|with|by|for)?|spent|charged)\s*"
         r"(?:PKR|Rs\.?|PK\s*Rs\.?)\s*[0-9,.]+\s+at|"
         r"purchase\s+at|pos\s+at)\s+"
-        r"([A-Za-z0-9 *&'.\-/]{2,60}?)(?:\s+on\s+\d|\s+for\s+(?:PKR|Rs)|\.|\n|$)",
+        r"([A-Za-z0-9 *&'.\-/]{2,60}?)(?:\s+on\s+\d|\s+for\s+(?:PKR|Rs)|\.(?=\s|$)|\n|$)",
         cleaned_body,
     )
     if m_at:
         return m_at.group(1).strip()
 
-    m_debited_at = re.search(
-        r"(?i)\bdebited\b(?:[^\n.]|\.(?=\d)){0,70}?\bat\s+"
-        r"([A-Za-z0-9 *&'.\-/]{2,60}?)(?:\s+on\s+\d|\s+for\s+(?:PKR|Rs)|\.|\n|$)",
+    for m_debited_at in re.finditer(
+        r"(?i)\bdebited\b(?:[^\n.]|\.(?=\d)){0,90}?\bat\s+"
+        r"([A-Za-z0-9 *&'.\-/]{2,60}?)(?:\s+on\s+\d|\s+for\s+(?:PKR|Rs)|\.(?=\s|$)|\n|$)",
         cleaned_body,
-    )
-    if m_debited_at:
+    ):
         cand_at = m_debited_at.group(1).strip()
         if not re.match(
             r"(?i)^(?:your\s+|the\s+|a\s+|an\s+|habib\s*metro\b|\d{1,2}:\d{2}\b)",
@@ -798,6 +840,7 @@ def _extract_hmb_payee(
 
     m_rel = re.search(
         r"(?i)\b(?:ibft|raast|fund\s+transfer|transfer(?:red)?|payment|paid|sent|received)\s+"
+        r"(?:from\s+(?:your\s+)?(?:hmb\b|habib\s*metro\b|a/c\b|account\b)\s*[*●•\d\-]+\s+)?"
         r"(?:to|from)\s+([A-Za-z0-9 *&'.\-/()]{2,70}?)"
         r"(?:\s+from\s+(?:your\s+)?(?:hmb\b|habib\s*metro\b|a/c\b|account\b)|\s+on\s+\d|\s+via\s+|\s+ref|\n|\.(?=\s|$)|$)",
         cleaned_body,
@@ -848,7 +891,22 @@ def parse_hmb_email(
 
     structured = html_to_structured_text(body)
     cleaned_body, forwarded_sent, forwarded_subject = _extract_outlook_forward_meta(structured)
-    effective_subject = subject.strip() if subject and subject.strip() else forwarded_subject
+    raw_subj = (subject or "").strip()
+    if forwarded_subject and (
+        not raw_subj or re.match(r"(?i)^fwd?\s*:", raw_subj)
+    ):
+        effective_subject = forwarded_subject
+    else:
+        effective_subject = raw_subj or forwarded_subject
+
+    if not re.search(
+        r"(?i)\b(?:has\s+been\s+(?:debited|credited|used)|debited|credited|"
+        r"debit(?!\s+card\b)|credit(?!\s+card\b)|was\s+used|used\s+for|sent|paid|"
+        r"spent|received|withdrawn|withdrawal|transfer(?:red)?|purchase|charged|"
+        r"refund(?:ed)?|transaction\s+amount)\b",
+        f"{effective_subject}\n{cleaned_body}",
+    ):
+        return None
 
     amount, tax_fee_amount = _extract_hmb_amount_and_fee(cleaned_body, effective_subject)
     if amount is None or amount <= 0.0:
@@ -874,6 +932,8 @@ def parse_hmb_email(
             mmf_or_internal_bucket,
             payment_channel,
         ) = classify_hmb_transfer(payee, cleaned_body, payment_channel)
+        if tx_type == "TRANSFER_INTERNAL" and suggested_category == "Cash Envelope":
+            suggested_category = "Cash Withdrawal"
         if mmf_or_internal_bucket is not None:
             suggested_bucket = mmf_or_internal_bucket
 

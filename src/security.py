@@ -7,18 +7,21 @@ import hashlib
 import hmac
 import imaplib
 import json
+import math
 import os
 import re
 import ssl
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
-from email.message import EmailMessage
+from datetime import datetime, timedelta, timezone
 from email import message_from_bytes
+from email.message import EmailMessage
 from pathlib import Path
 from typing import Any, Callable, Optional
+from zoneinfo import ZoneInfo
 
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
@@ -53,7 +56,8 @@ def get_secret(key: str, default: str = "") -> str:
     """Resolve a configuration secret from environment variables first, then Streamlit secrets."""
     if key in os.environ:
         val = (os.environ.get(key) or "").strip()
-        return val if val else default
+        if val:
+            return val
 
     try:
         import streamlit as st
@@ -71,6 +75,16 @@ def get_secret(key: str, default: str = "") -> str:
     return default
 
 
+def get_local_now() -> datetime:
+    """Return timezone-aware current datetime in configured TREASURY_TIMEZONE (default Asia/Karachi UTC+05:00)."""
+    tz_name = get_secret("TREASURY_TIMEZONE", "Asia/Karachi")
+    try:
+        tz: Any = ZoneInfo(tz_name)
+    except Exception:
+        tz = timezone(timedelta(hours=5))
+    return datetime.now(tz)
+
+
 def redact_sensitive_text(text: Any) -> str:
     """Mask known credentials, tokens, and password fields before logging or displaying errors."""
     if text is None:
@@ -80,6 +94,7 @@ def redact_sensitive_text(text: Any) -> str:
     for env_key in (
         "GMAIL_APP_PASSWORD",
         "GITHUB_BACKUP_TOKEN",
+        "GITHUB_BACKUP_GIST_ID",
         "TREASURY_APP_PASSWORD",
         "TREASURY_APP_PASSWORD_HASH",
         "TREASURY_BACKUP_KEY",
@@ -173,6 +188,8 @@ def get_session_timeout_seconds() -> int:
         minutes = float(raw)
     except ValueError:
         return 15 * 60
+    if not math.isfinite(minutes):
+        return 15 * 60
     if minutes <= 0:
         return 0
     return max(1, int(min(minutes, 1440.0) * 60))
@@ -187,39 +204,46 @@ class AuthRateLimiter:
         base_cooldown_seconds: int = 30,
         max_cooldown_seconds: int = 300,
         time_fn: Callable[[], float] = time.monotonic,
+        decay_seconds: float = 86400.0,
     ) -> None:
         self._max_failures = max(1, int(max_failures))
         self._base_cooldown = max(1, int(base_cooldown_seconds))
         self._max_cooldown = max(self._base_cooldown, int(max_cooldown_seconds))
         self._time_fn = time_fn
+        self._decay_seconds = max(60.0, float(decay_seconds))
         self._lock = threading.Lock()
-        self._state: dict[str, tuple[int, float]] = {}
+        self._state: dict[str, tuple[int, float, float]] = {}
 
     def is_locked(self, key: str = "global") -> tuple[bool, int]:
         """Return (locked, remaining_seconds) for the given rate-limit bucket."""
         now = self._time_fn()
         with self._lock:
-            failures, locked_until = self._state.get(key, (0, 0.0))
+            failures, locked_until, last_fail = self._state.get(key, (0, 0.0, 0.0))
             if locked_until > now:
                 remaining = int(max(1, round(locked_until - now)))
                 return True, remaining
+            if last_fail > 0.0 and (now - last_fail) > self._decay_seconds:
+                self._state.pop(key, None)
+                return False, 0
             if locked_until > 0.0 and locked_until <= now:
                 # Preserve failure count so the next bad attempt escalates cooldown.
-                self._state[key] = (failures, 0.0)
+                self._state[key] = (failures, 0.0, last_fail)
             return False, 0
 
     def record_failure(self, key: str = "global") -> int:
         """Record a failed auth attempt and return cooldown seconds applied (0 if below threshold)."""
         now = self._time_fn()
         with self._lock:
-            failures, _ = self._state.get(key, (0, 0.0))
+            failures, _, last_fail = self._state.get(key, (0, 0.0, 0.0))
+            if last_fail > 0.0 and (now - last_fail) > self._decay_seconds:
+                failures = 0
             failures += 1
             if failures < self._max_failures:
-                self._state[key] = (failures, 0.0)
+                self._state[key] = (failures, 0.0, now)
                 return 0
-            exponent = failures - self._max_failures
+            exponent = min(failures - self._max_failures, 20)
             cooldown = min(self._max_cooldown, self._base_cooldown * (2**exponent))
-            self._state[key] = (failures, now + float(cooldown))
+            self._state[key] = (failures, now + float(cooldown), now)
             return int(cooldown)
 
     def record_success(self, key: str = "global") -> None:
@@ -229,8 +253,12 @@ class AuthRateLimiter:
 
     def failure_count(self, key: str = "global") -> int:
         """Return current consecutive failure count for a bucket."""
+        now = self._time_fn()
         with self._lock:
-            return self._state.get(key, (0, 0.0))[0]
+            failures, locked_until, last_fail = self._state.get(key, (0, 0.0, 0.0))
+            if locked_until <= now and last_fail > 0.0 and (now - last_fail) > self._decay_seconds:
+                return 0
+            return failures
 
     def reset(self) -> None:
         """Clear all tracked rate-limit buckets."""
@@ -249,13 +277,14 @@ def get_auth_rate_limiter() -> AuthRateLimiter:
 def _derive_fernet_key(passphrase: str, salt: bytes, iterations: int = PBKDF2_ITERATIONS) -> bytes:
     if not isinstance(passphrase, str) or not passphrase.strip():
         raise ValueError("Encryption passphrase must be non-empty.")
+    clean_passphrase = passphrase.strip()
     kdf = PBKDF2HMAC(
         algorithm=hashes.SHA256(),
         length=32,
         salt=salt,
         iterations=iterations,
     )
-    raw_key = kdf.derive(passphrase.encode("utf-8"))
+    raw_key = kdf.derive(clean_passphrase.encode("utf-8"))
     return base64.urlsafe_b64encode(raw_key)
 
 
@@ -301,6 +330,9 @@ def decrypt_backup_payload(envelope_text: str, passphrase: str) -> str:
         raise ValueError("Unsupported encrypted backup version.")
     if envelope.get("kdf") != "pbkdf2_hmac_sha256":
         raise ValueError("Unsupported backup KDF.")
+    cipher = envelope.get("cipher")
+    if cipher not in (None, "fernet_aes128_cbc_hmac_sha256", "fernet-aes128-cbc-hmac-sha256"):
+        raise ValueError("Unsupported backup cipher.")
 
     try:
         iterations = int(envelope.get("iterations", 0))
@@ -308,6 +340,8 @@ def decrypt_backup_payload(envelope_text: str, passphrase: str) -> str:
         raise ValueError("Invalid KDF iteration count in backup envelope.") from exc
     if iterations < 100_000:
         raise ValueError("Backup KDF iteration count is below minimum policy.")
+    if iterations > 2_000_000:
+        raise ValueError("Backup KDF iteration count exceeds safety cap (2,000,000).")
 
     try:
         salt = base64.b64decode(str(envelope["salt"]).encode("ascii"), validate=True)
@@ -341,6 +375,14 @@ def get_cloud_sync_status() -> dict[str, Any]:
             "provider": "disabled",
             "has_passphrase": passphrase_ok,
             "detail": "Cloud auto-sync is explicitly disabled (TREASURY_CLOUD_SYNC=off).",
+        }
+    if mode and mode not in {"auto", "gmail", "gmail_imap", "gist", "github_gist"}:
+        return {
+            "configured": False,
+            "backend_ready": False,
+            "provider": "invalid",
+            "has_passphrase": passphrase_ok,
+            "detail": f"Invalid TREASURY_CLOUD_SYNC mode '{mode}'. Use gist, gmail, auto, or off.",
         }
 
     gh_token = get_secret("GITHUB_BACKUP_TOKEN")
@@ -474,6 +516,24 @@ def _push_gmail_imap_vault(envelope_json: str) -> tuple[bool, str]:
         )
         if status != "OK":
             return False, f"Gmail IMAP append rejected with status {status}."
+        # Prune older self-vault snapshots beyond the latest 5
+        try:
+            sel_status, _ = imap.select("INBOX", readonly=False)
+            if sel_status == "OK":
+                s_status, s_data = imap.search(
+                    None, "FROM", f'"{user}"', "SUBJECT", f'"{GMAIL_VAULT_SUBJECT}"'
+                )
+                if s_status == "OK" and s_data and s_data[0]:
+                    all_ids = sorted(
+                        (tok for tok in s_data[0].split() if tok.isdigit()),
+                        key=lambda tok: int(tok),
+                    )
+                    if len(all_ids) > 5:
+                        for old_id in all_ids[:-5]:
+                            imap.store(old_id, "+FLAGS", "(\\Deleted)")
+                        imap.expunge()
+        except Exception:
+            pass
         return True, "Encrypted vault pushed to Gmail IMAP self-vault."
     except Exception as exc:
         return False, redact_sensitive_text(f"Gmail IMAP vault push failed: {exc}")
@@ -496,8 +556,12 @@ def _pull_gmail_imap_vault() -> tuple[Optional[str], str]:
         ctx = ssl.create_default_context()
         imap = imaplib.IMAP4_SSL("imap.gmail.com", 993, ssl_context=ctx, timeout=10)
         imap.login(user, app_pw)
-        imap.select("INBOX", readonly=True)
-        status, data = imap.search(None, "SUBJECT", f'"{GMAIL_VAULT_SUBJECT}"')
+        sel_status, _ = imap.select("INBOX", readonly=True)
+        if sel_status != "OK":
+            return None, f"Failed to open Gmail INBOX (status {sel_status})."
+        status, data = imap.search(
+            None, "FROM", f'"{user}"', "SUBJECT", f'"{GMAIL_VAULT_SUBJECT}"'
+        )
         if status != "OK" or not data or not data[0]:
             return None, "No encrypted Gmail vault snapshot found yet."
 
@@ -508,29 +572,47 @@ def _pull_gmail_imap_vault() -> tuple[Optional[str], str]:
         if not msg_ids:
             return None, "No encrypted Gmail vault snapshot found yet."
 
-        latest_id = msg_ids[-1]
-        fetch_status, msg_data = imap.fetch(latest_id, "(RFC822)")
-        if fetch_status != "OK" or not msg_data:
-            return None, "Failed to read Gmail encrypted vault message."
+        def _extract_vault_text(parsed_msg: Any) -> str:
+            if parsed_msg.is_multipart():
+                for part in parsed_msg.walk():
+                    if part.get_content_maintype() == "multipart":
+                        continue
+                    p_bytes = part.get_payload(decode=True)
+                    if isinstance(p_bytes, (bytes, bytearray)):
+                        candidate = p_bytes.decode("utf-8", errors="replace").strip()
+                        if VAULT_ENVELOPE_FORMAT in candidate:
+                            return candidate
+                return ""
+            p_bytes = parsed_msg.get_payload(decode=True)
+            if isinstance(p_bytes, (bytes, bytearray)):
+                return p_bytes.decode("utf-8", errors="replace").strip()
+            return str(parsed_msg.get_payload() or "").strip()
 
-        raw_bytes: Optional[bytes] = None
-        for item in msg_data:
-            if isinstance(item, tuple) and len(item) >= 2 and isinstance(item[1], (bytes, bytearray)):
-                raw_bytes = bytes(item[1])
-                break
-        if not raw_bytes:
-            return None, "Empty Gmail encrypted vault message."
+        for msg_id in reversed(msg_ids):
+            fetch_status, msg_data = imap.fetch(msg_id, "(RFC822)")
+            if fetch_status != "OK" or not msg_data:
+                continue
+            raw_bytes: Optional[bytes] = None
+            for item in msg_data:
+                if isinstance(item, tuple) and len(item) >= 2 and isinstance(item[1], (bytes, bytearray)):
+                    raw_bytes = bytes(item[1])
+                    break
+            if not raw_bytes:
+                continue
+            parsed = message_from_bytes(raw_bytes)
+            if str(parsed.get("X-PTOS-Vault") or "").strip() != "1":
+                continue
+            envelope_text = _extract_vault_text(parsed)
+            if not envelope_text:
+                continue
+            try:
+                env_obj = json.loads(envelope_text)
+                if isinstance(env_obj, dict) and env_obj.get("format") == VAULT_ENVELOPE_FORMAT:
+                    return envelope_text, "Encrypted vault pulled from Gmail IMAP."
+            except Exception:
+                continue
 
-        parsed = message_from_bytes(raw_bytes)
-        payload = parsed.get_payload(decode=True)
-        if isinstance(payload, (bytes, bytearray)):
-            envelope_text = payload.decode("utf-8", errors="replace").strip()
-        else:
-            envelope_text = str(parsed.get_payload() or "").strip()
-
-        if not envelope_text:
-            return None, "Gmail encrypted vault message had no payload."
-        return envelope_text, "Encrypted vault pulled from Gmail IMAP."
+        return None, "No valid encrypted Gmail vault snapshot found."
     except Exception as exc:
         return None, redact_sensitive_text(f"Gmail IMAP vault pull failed: {exc}")
     finally:
@@ -589,8 +671,12 @@ def pull_encrypted_cloud_backup() -> tuple[Optional[str], str]:
                 return None, "GitHub Gist does not yet contain a vault snapshot."
             if file_entry.get("truncated") and file_entry.get("raw_url"):
                 raw_url = str(file_entry["raw_url"])
-                if not raw_url.startswith("https://"):
-                    return None, "Refusing non-HTTPS Gist raw_url."
+                parsed_raw = urllib.parse.urlparse(raw_url)
+                if (
+                    parsed_raw.scheme != "https"
+                    or (parsed_raw.hostname or "").lower() != "gist.githubusercontent.com"
+                ):
+                    return None, "Refusing untrusted Gist raw_url host."
                 req = urllib.request.Request(
                     raw_url,
                     headers={

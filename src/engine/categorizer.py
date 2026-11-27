@@ -14,6 +14,7 @@ from src.models import (
     CostBucket,
     ParsedTransaction,
     TransactionRecord,
+    TxType,
 )
 
 if TYPE_CHECKING:
@@ -29,7 +30,8 @@ _AMC_KEYWORDS: tuple[str, ...] = (
     "MCF",
     "NBP FUND",
     "UBL FUND",
-    "AL-AMEEN",
+    "AL-AMEEN FUNDS",
+    "AL-AMEEN FUND",
     "ALFALAH GHP",
     "ALFALAH ASSET",
     "ALFALAH INVESTMENT",
@@ -38,7 +40,9 @@ _AMC_KEYWORDS: tuple[str, ...] = (
 _KE_EXPLICIT_RE = re.compile(
     r"(?i)(?:\bk-electric\b|\bkarachi\s+electric\b|\bke\s+(?:bill|electric|power)\b)"
 )
-_J_DOT_RE = re.compile(r"(?i)(?<![a-z0-9.])(?<!\b[a-z]\.\s)j\.(?:\s|$)")
+_J_DOT_RE = re.compile(
+    r"(?i)(?<![a-z0-9.])(?<!\bdr\.\s)(?<!\bmr\.\s)(?<!\bms\.\s)(?<!\b[a-z]\.\s)j\.(?:\s|$)"
+)
 
 _FUND_CONTEXT_RE = re.compile(
     r"(?i)\b(?:meezan|al[\s\-]*meezan|amc|fund|funds|investment|investments|"
@@ -47,7 +51,7 @@ _FUND_CONTEXT_RE = re.compile(
 _NON_FUND_ENTITY_RE = re.compile(
     r"(?i)\b(?:traders?|trading|foundation|charity|welfare|trust|society|"
     r"enterprises?|store|mart|motors?|academy|school|clinic|hospital|"
-    r"restaurant|cafe|bakery|textiles?|pharma|consulting|club|builders?)\b"
+    r"restaurant|cafe|bakery|textiles?|pharma(?:cy)?|consulting|club|builders?)\b"
 )
 
 _STEAM_TECH_RE = re.compile(
@@ -65,7 +69,7 @@ _NON_PROFIT_RE = re.compile(
 )
 _FED_TAX_RE = re.compile(
     r"(?i)(?:\bfederal\s+excise\b|\bf\.e\.d\.?\b|"
-    r"(?<![a-z0-9])fed(?:\s*(?:tax|charges?|fee|deduction|amount|on|duty|rs|pkr|:|-|\()|\s*$)|"
+    r"(?<![a-z0-9])fed(?:\s*(?:tax|charges?|fee|deduction|amount|on|duty|rs|pkr|:|-|\())|"
     r"(?:&|\+|/|,|\()\s*fed(?![a-z0-9])|"
     r"(?:\bbank|\bibft|\bsms|\bcard|\bwht|\btax|\bcharges?)\s+fed(?![a-z0-9]))"
 )
@@ -78,16 +82,33 @@ _P2P_CUE_RE = re.compile(
     r"\breceived\s+from\b|\bmoney\s+sent\b|\bfunds?\s+transfer\b|"
     r"^(?:ibft|raast|p2p|ft|transfer)\b)"
 )
+_P2P_CHANNELS = frozenset({"Raast", "Wallet", "IBFT", "Fund Transfer"})
+_SHELL_NON_FUEL_RE = re.compile(r"(?i)\b(?:sea\s*shell|restaurant|cafe|coffee|bakery|grill)\b")
+_SHELL_FUEL_RE = re.compile(r"(?i)\b(?:petrol|fuel|diesel|pump|station|pakistan|energy|lubricant)\b")
 
 _NAYAPAY_TEXT_RE = re.compile(r"(?i)\bnaya\s*pay\b")
 _OWN_HMB_TRANSFER_RE = re.compile(
     r"(?i)(?:\b(?:own\s+account|self\s+transfer|my\s+habib\s*metro|habib\s*metro\s+self|"
     r"wallet\s+to\s+(?:my\s+)?habib\s*metro|my\s+hmb|hmb\s+self)\b)"
 )
-_ATM_WITHDRAWAL_RE = re.compile(r"(?i)\b(?:atm|cash\s+withdrawal)\b")
+_ATM_WITHDRAWAL_RE = re.compile(
+    r"(?i)\b(?:atm(?!\s*(?:/\s*debit)?\s*card\b)|cash\s+withdrawal)\b"
+)
 _ATM_NON_WITHDRAWAL_RE = re.compile(
     r"(?i)\b(?:pos|purchase|fee|charges?|tax|wht|fed|surcharge|annual|"
     r"issuance|replacement|pin|inquiry)\b"
+)
+_VALID_TRANSFER_CATEGORIES = frozenset(
+    {"Internal Transfer", "Wallet Top-Up", "Cash Withdrawal", "MMF Redemption"}
+)
+_GENERIC_FALLBACK_PAYEES = frozenset(
+    {
+        "statement transaction",
+        "nayapay transaction",
+        "mobile bundle",
+        "mobile balance top-up",
+        "atm cash withdrawal",
+    }
 )
 
 _TRAILING_EMOJI_RE = re.compile(
@@ -218,11 +239,10 @@ def _keyword_matches(
         return False
 
     if is_user_defined:
-        if len(kw) >= 5:
-            return kw.lower() in text.lower()
         return _boundary_match(kw, text)
 
     upper_kw = kw.upper()
+    canon_upper = extract_canonical_payee(text).strip().upper()
     stripped_upper = text.strip().upper()
 
     if upper_kw == "KE":
@@ -231,37 +251,38 @@ def _keyword_matches(
     if upper_kw == "J.":
         return bool(_J_DOT_RE.search(text))
 
-    if upper_kw in ("MRAF", "MCF"):
+    if upper_kw in ("MRAF", "MCF", "AL-AMEEN"):
         if not _boundary_match(kw, text):
             return False
-        if stripped_upper == upper_kw:
+        if stripped_upper == upper_kw or canon_upper == upper_kw:
             return True
         if _NON_FUND_ENTITY_RE.search(text):
             return bool(
                 re.search(
-                    r"(?i)\b(?:meezan|al[\s\-]*meezan|amc|mutual|rozana|cash\s+fund)\b",
+                    r"(?i)\b(?:meezan|al[\s\-]*meezan|amc|mutual|rozana|cash\s+fund|fund|funds)\b",
                     text,
                 )
             )
         return bool(
             _FUND_CONTEXT_RE.search(text)
             or re.search(rf"(?i)(?:\({upper_kw}\)|\bibft\b)", text)
+            or upper_kw == "AL-AMEEN"
         )
 
     if upper_kw == "STEAM":
-        if stripped_upper == "STEAM":
+        if stripped_upper == "STEAM" or canon_upper == "STEAM":
             return True
         return bool(_STEAM_TECH_RE.search(text))
 
     if upper_kw == "APPLE":
-        if stripped_upper == "APPLE":
+        if stripped_upper == "APPLE" or canon_upper == "APPLE":
             return True
         return bool(_APPLE_TECH_RE.search(text))
 
     if upper_kw == "FED":
         if _FED_UP_RE.search(text):
             return False
-        if stripped_upper == "FED":
+        if stripped_upper == "FED" or canon_upper == "FED":
             return True
         return bool(_FED_TAX_RE.search(text))
 
@@ -270,19 +291,34 @@ def _keyword_matches(
             return False
         return _boundary_match(kw, text)
 
-    if upper_kw in ("IMTIAZ", "NAHEED"):
+    if upper_kw in ("IMTIAZ", "NAHEED", "SHIFA"):
         if not _boundary_match(kw, text):
             return False
-        if stripped_upper == upper_kw:
+        if stripped_upper == upper_kw or canon_upper == upper_kw:
+            return True
+        if upper_kw == "SHIFA":
+            if re.search(r"(?i)\b(?:hospital|int(?:ernational|\.)|clinic|medical|lab)\b", text):
+                return True
+            if (payment_channel in _P2P_CHANNELS) or _P2P_CUE_RE.search(text):
+                return False
             return True
         if _GROCERY_STORE_CUE_RE.search(text):
             return True
-        if payment_channel == "Raast" or _P2P_CUE_RE.search(text):
+        if (payment_channel in _P2P_CHANNELS) or _P2P_CUE_RE.search(text):
+            return False
+        return True
+
+    if upper_kw == "SHELL":
+        if not _boundary_match(kw, text):
+            return False
+        if _SHELL_NON_FUEL_RE.search(text) and not _SHELL_FUEL_RE.search(text):
             return False
         return True
 
     if upper_kw == "ATM":
         if not _boundary_match(kw, text):
+            return False
+        if re.search(r"(?i)\bcard\b", text) and not re.search(r"(?i)\bcash\s+withdrawal\b", text):
             return False
         return not bool(_ATM_NON_WITHDRAWAL_RE.search(text))
 
@@ -359,7 +395,11 @@ def _match_verified_history(
     merchant_alias = base.get("merchant_alias")
 
     canon_payee = extract_canonical_payee(payee).strip().lower()
-    if len(canon_payee) < 3 or _is_masked_payee(canon_payee):
+    if (
+        len(canon_payee) < 3
+        or _is_masked_payee(canon_payee)
+        or canon_payee in _GENERIC_FALLBACK_PAYEES
+    ):
         return None
 
     for vtx in verified_txs:
@@ -422,7 +462,10 @@ def _match_verified_history(
 def _infer_transfer_target_from_rule(
     matched_rule: CategoryRule, account_name: str
 ) -> Optional[str]:
-    """Infer destination wallet for IGNORE internal-transfer rules when named."""
+    """Infer destination wallet for IGNORE internal-transfer rules when explicitly named."""
+    explicit = (matched_rule.target_account or "").strip()
+    if explicit and explicit != account_name and explicit != WALLET_MMF:
+        return explicit
     probe = " ".join(
         part
         for part in (
@@ -456,13 +499,29 @@ def _apply_matched_rule(
     if not merchant_alias and matched_rule.merchant_alias:
         base["merchant_alias"] = matched_rule.merchant_alias
 
+    account_name = str(base["account_name"])
     if tx_type == "DEBIT" and matched_rule.cost_bucket == "INVESTMENT":
-        base["tx_type"] = "TRANSFER_MMF"
-        base["target_account"] = WALLET_MMF
-        base["category"] = "Money Market Fund"
-        base["cost_bucket"] = "INVESTMENT"
-        base["review_status"] = "AUTO_VERIFIED"
-        base["is_internal_transfer"] = False
+        if account_name != WALLET_MMF:
+            base["tx_type"] = "TRANSFER_MMF"
+            base["target_account"] = WALLET_MMF
+            base["category"] = "Money Market Fund"
+            base["cost_bucket"] = "INVESTMENT"
+            base["review_status"] = "AUTO_VERIFIED"
+            base["is_internal_transfer"] = False
+        else:
+            # Debits on MMF itself cannot be TRANSFER_MMF; treat fees as LEAKAGE, others for review
+            base["tx_type"] = "DEBIT"
+            base["target_account"] = None
+            base["is_internal_transfer"] = False
+            payee_low = str(base.get("payee") or "").lower()
+            if any(k in payee_low for k in ("fee", "tax", "wht", "zakat", "charges", "fed")):
+                base["category"] = "Bank & Tax Friction"
+                base["cost_bucket"] = "LEAKAGE"
+                base["review_status"] = "AUTO_VERIFIED"
+            else:
+                base["category"] = "Uncategorized"
+                base["cost_bucket"] = "VARIABLE"
+                base["review_status"] = "NEEDS_REVIEW"
     elif tx_type == "CREDIT":
         base["category"] = matched_rule.category
         base["cost_bucket"] = "INFLOW"
@@ -472,14 +531,31 @@ def _apply_matched_rule(
         base["cost_bucket"] = matched_rule.cost_bucket
         base["review_status"] = "AUTO_VERIFIED"
         if matched_rule.cost_bucket == "IGNORE":
-            base["is_internal_transfer"] = True
-            if tx_type == "DEBIT" and not base.get("target_account"):
-                inferred_target = _infer_transfer_target_from_rule(
-                    matched_rule, str(base["account_name"])
+            if tx_type == "DEBIT":
+                inferred_target = base.get("target_account") or _infer_transfer_target_from_rule(
+                    matched_rule, account_name
                 )
-                if inferred_target:
+                if (
+                    inferred_target
+                    and inferred_target != account_name
+                    and inferred_target != WALLET_MMF
+                ):
                     base["tx_type"] = "TRANSFER_INTERNAL"
                     base["target_account"] = inferred_target
+                    base["is_internal_transfer"] = True
+                elif inferred_target == WALLET_MMF and account_name != WALLET_MMF:
+                    base["tx_type"] = "TRANSFER_MMF"
+                    base["target_account"] = WALLET_MMF
+                    base["category"] = "Money Market Fund"
+                    base["cost_bucket"] = "INVESTMENT"
+                    base["is_internal_transfer"] = False
+                else:
+                    # Never silently create an AUTO_VERIFIED DEBIT/IGNORE black hole
+                    base["is_internal_transfer"] = False
+                    base["cost_bucket"] = "VARIABLE"
+                    base["review_status"] = "NEEDS_REVIEW"
+            else:
+                base["is_internal_transfer"] = True
     return TransactionRecord.model_validate(base)
 
 
@@ -500,6 +576,26 @@ def _apply_rules_with_list(
     merchant_alias = base.get("merchant_alias")
     payment_channel = base.get("payment_channel")
 
+    # Sort defensively: priority DESC, keyword length DESC, id DESC
+    ordered_rules = sorted(
+        rules,
+        key=lambda r: (r.priority, len(r.keyword.strip()), r.id or 0),
+        reverse=True,
+    )
+
+    # User-defined rules (priority-100) override parser-preclassified transfers on ParsedTransaction
+    if isinstance(tx, ParsedTransaction) and tx_type in ("TRANSFER_INTERNAL", "TRANSFER_MMF"):
+        for rule in ordered_rules:
+            if not rule.is_user_defined or rule.cost_bucket == "INFLOW":
+                continue
+            if _rule_matches_tx(rule, payee, merchant_alias, payment_channel):
+                if rule.cost_bucket in ("FIXED", "VARIABLE", "LEAKAGE"):
+                    base["tx_type"] = "DEBIT"
+                    base["target_account"] = None
+                    base["is_internal_transfer"] = False
+                    return _apply_matched_rule(base, rule, "DEBIT", merchant_alias)
+                break
+
     if tx_type == "TRANSFER_INTERNAL":
         base["is_internal_transfer"] = True
         base["cost_bucket"] = "IGNORE"
@@ -507,7 +603,7 @@ def _apply_rules_with_list(
         existing_cat = base.get("category")
         if existing_cat and existing_cat != "Uncategorized":
             base["category"] = existing_cat
-        elif suggested_category:
+        elif suggested_category and suggested_category in _VALID_TRANSFER_CATEGORIES:
             base["category"] = suggested_category
         elif target_account == WALLET_CASH:
             base["category"] = "Cash Withdrawal"
@@ -525,15 +621,10 @@ def _apply_rules_with_list(
         base["is_internal_transfer"] = False
         return TransactionRecord.model_validate(base)
 
-    # Sort defensively: priority DESC, keyword length DESC, id DESC
-    ordered_rules = sorted(
-        rules,
-        key=lambda r: (r.priority, len(r.keyword.strip()), r.id or 0),
-        reverse=True,
-    )
-
     matched_rule: Optional[CategoryRule] = None
     for rule in ordered_rules:
+        if tx_type == "CREDIT" and rule.cost_bucket != "INFLOW":
+            continue
         if rule.cost_bucket == "INFLOW" and tx_type != "CREDIT":
             continue
         if (
@@ -552,12 +643,22 @@ def _apply_rules_with_list(
     ):
         return _apply_matched_rule(base, matched_rule, tx_type, merchant_alias)
 
-    # Suggested LEAKAGE fee/tax rows (e.g., PDF/CSV fees) must not be promoted to transfers
-    if tx_type == "DEBIT" and suggested_bucket == "LEAKAGE" and matched_rule is None:
+    # Suggested LEAKAGE fee/tax rows (e.g., PDF/CSV fees) must not be promoted to transfers or merchants
+    if tx_type == "DEBIT" and suggested_bucket == "LEAKAGE":
         base["category"] = suggested_category or "Bank & Tax Friction"
         base["cost_bucket"] = "LEAKAGE"
         base["review_status"] = "AUTO_VERIFIED"
         return TransactionRecord.model_validate(base)
+
+    # Explicit merchant/AMC default rules outrank generic HMB->"NayaPay" text matching
+    if matched_rule is not None and matched_rule.cost_bucket in ("FIXED", "VARIABLE", "INVESTMENT"):
+        if not (
+            account_name == WALLET_HABIBMETRO
+            and tx_type == "DEBIT"
+            and _NAYAPAY_TEXT_RE.search(payee)
+            and _NAYAPAY_TEXT_RE.search(matched_rule.keyword)
+        ):
+            return _apply_matched_rule(base, matched_rule, tx_type, merchant_alias)
 
     # HabibMetro DEBIT to NayaPay -> internal wallet top-up
     if (
@@ -591,11 +692,11 @@ def _apply_rules_with_list(
             base["merchant_alias"] = "Own HabibMetro Transfer"
         return TransactionRecord.model_validate(base)
 
-    # HabibMetro ATM / Cash Withdrawal DEBIT -> internal transfer to Cash in Hand
+    # HabibMetro / NayaPay ATM / Cash Withdrawal DEBIT -> internal transfer to Cash in Hand
     if (
-        account_name == WALLET_HABIBMETRO
+        account_name in (WALLET_HABIBMETRO, WALLET_NAYAPAY)
         and tx_type == "DEBIT"
-        and payment_channel != "POS"
+        and payment_channel not in ("POS", "Card")
         and _ATM_WITHDRAWAL_RE.search(payee)
         and not _ATM_NON_WITHDRAWAL_RE.search(payee)
     ):
@@ -612,8 +713,8 @@ def _apply_rules_with_list(
     if matched_rule is not None:
         return _apply_matched_rule(base, matched_rule, tx_type, merchant_alias)
 
-    # Fallback AMC detection for DEBITs even if seed rules were customized
-    if tx_type == "DEBIT" and _matches_any_amc(payee, merchant_alias):
+    # Fallback AMC detection for non-MMF DEBITs even if seed rules were customized
+    if tx_type == "DEBIT" and account_name != WALLET_MMF and _matches_any_amc(payee, merchant_alias):
         base["tx_type"] = "TRANSFER_MMF"
         base["target_account"] = WALLET_MMF
         base["category"] = "Money Market Fund"
@@ -711,17 +812,19 @@ def learn_new_rule(
     if len(rule_keyword) < 3:
         raise ValueError("Rule keyword must be at least 3 characters")
 
+    clean_target = target_account.strip() if target_account and target_account.strip() else None
     rule = CategoryRule(
         keyword=rule_keyword,
         merchant_alias=alias.strip() if alias else None,
         category=category.strip(),
         cost_bucket=cost_bucket,
+        target_account=clean_target,
         priority=100,
         is_user_defined=True,
     )
     return db.learn_and_apply_rule(
         rule,
         overwrite_verified=overwrite_verified,
-        target_account=target_account,
+        target_account=clean_target,
         source_tx_type=source_tx_type,
     )

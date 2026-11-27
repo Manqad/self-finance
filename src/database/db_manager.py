@@ -48,12 +48,14 @@ from src.models import (
     ReviewStatus,
     TransactionRecord,
     TxType,
+    normalize_balance_as_of,
 )
 from src.security import (
     decrypt_backup_payload,
     encrypt_backup_payload,
     get_backup_passphrase,
     get_cloud_sync_status,
+    get_local_now,
     get_secret,
     pull_encrypted_cloud_backup,
     push_encrypted_cloud_backup,
@@ -165,6 +167,7 @@ CREATE TABLE IF NOT EXISTS category_rules (
     merchant_alias TEXT,
     category TEXT NOT NULL,
     cost_bucket TEXT NOT NULL CHECK (cost_bucket IN ('INFLOW', 'FIXED', 'VARIABLE', 'LEAKAGE', 'INVESTMENT', 'IGNORE')),
+    target_account TEXT,
     priority INTEGER NOT NULL DEFAULT 10,
     is_user_defined INTEGER NOT NULL DEFAULT 0 CHECK (is_user_defined IN (0, 1)),
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -279,9 +282,35 @@ def _extract_masked_4_digits(text: Optional[str]) -> set[str]:
     return set(_MASKED_4DIGIT_RE.findall(text or ""))
 
 
+_STOP_TOKENS = frozenset(
+    {
+        "muhammad",
+        "mohammad",
+        "mohammed",
+        "transfer",
+        "payment",
+        "bank",
+        "raast",
+        "ibft",
+        "account",
+        "pkr",
+        "sent",
+        "paid",
+        "received",
+        "from",
+        "the",
+    }
+)
+_STRUCTURED_TAG_RE = re.compile(r"\[(?:alt_id|alt_src|paired|bill):[^\]]+\]")
+
+
 def _canonical_tokens(canon: str) -> set[str]:
-    """Return lowercase alphanumeric tokens >= 3 chars for overlap checks."""
-    return set(re.findall(r"[a-z0-9]{3,}", (canon or "").lower()))
+    """Return lowercase alphanumeric tokens >= 3 chars for overlap checks (excluding noise words)."""
+    return {
+        tok
+        for tok in re.findall(r"[a-z0-9]{3,}", (canon or "").lower())
+        if tok not in _STOP_TOKENS
+    }
 
 
 def _append_alt_tags(
@@ -290,16 +319,27 @@ def _append_alt_tags(
     alt_source: str,
     extra_notes: Optional[str] = None,
 ) -> str:
-    """Append [alt_id:...] and [alt_src:...] idempotently onto transaction notes."""
+    """Append [alt_id:...]/[alt_src:...] and preserve structured tags & non-duplicate user notes."""
     base = (existing_notes or "").strip()
-    if not base and extra_notes and extra_notes.strip():
-        base = extra_notes.strip()
-    parts = [base] if base else []
+    extra = (extra_notes or "").strip()
+    parts: list[str] = [base] if base else []
+    if extra:
+        if not base:
+            parts.append(extra)
+        else:
+            # Preserve all structured tags ([alt_id:...], [paired:...], [bill:...], etc.)
+            for tag in _STRUCTURED_TAG_RE.findall(extra):
+                if tag not in base and tag not in " ".join(parts):
+                    parts.append(tag)
+            extra_plain = _STRUCTURED_TAG_RE.sub("", extra).strip(" |")
+            if extra_plain and extra_plain.lower() not in base.lower():
+                parts.append(extra_plain)
+    joined_so_far = " ".join(parts)
     alt_id_tag = f"[alt_id:{alt_message_id}]"
     alt_src_tag = f"[alt_src:{alt_source}]"
-    if alt_id_tag not in base:
+    if alt_id_tag not in joined_so_far:
         parts.append(alt_id_tag)
-    if alt_src_tag not in base:
+    if alt_src_tag not in joined_so_far:
         parts.append(alt_src_tag)
     return " ".join(parts).strip()
 
@@ -326,7 +366,9 @@ def _same_source_alert_duplicate_match(row_a: Any, row_b: Any) -> bool:
 
     amt_a = float(row_a["amount"])
     amt_b = float(row_b["amount"])
-    if abs(amt_a - amt_b) > 0.01:
+    tax_a = float(row_a["tax_fee_amount"] or 0.0)
+    tax_b = float(row_b["tax_fee_amount"] or 0.0)
+    if abs(amt_a - amt_b) > 0.01 or abs(tax_a - tax_b) > 0.01:
         return False
 
     ts_a = str(row_a["tx_timestamp"] or "").strip().replace("T", " ")[:19]
@@ -335,8 +377,9 @@ def _same_source_alert_duplicate_match(row_a: Any, row_b: Any) -> bool:
         return False
     if ts_a.endswith(" 00:00:00") and ts_b.endswith(" 00:00:00"):
         return False
-    # Exact identical second OR same minute where at least one alert used :00 seconds fallback;
-    # genuine twin transactions with distinct non-:00 seconds (e.g. :17 vs :59) stay separate.
+    # Duplicate alerts from HabibMetro pair a body HH:MM (:00) email with a full HH:MM:SS email.
+    # Identical seconds or same minute with at least one :00 fallback is duplicate;
+    # genuine twins with distinct non-:00 seconds (e.g. :17 vs :59) stay separate.
     if ts_a != ts_b and not (
         ts_a[:16] == ts_b[:16] and (ts_a.endswith(":00") or ts_b.endswith(":00"))
     ):
@@ -348,8 +391,8 @@ def _same_source_alert_duplicate_match(row_a: Any, row_b: Any) -> bool:
         return False
     if pa == pb or (len(pa) >= 4 and len(pb) >= 4 and (pa in pb or pb in pa)):
         return True
-    toks_a = _canonical_tokens(str(row_a["payee"] or ""))
-    toks_b = _canonical_tokens(str(row_b["payee"] or ""))
+    toks_a = _canonical_tokens(pa)
+    toks_b = _canonical_tokens(pb)
     return bool(toks_a and toks_b and (toks_a & toks_b))
 
 
@@ -359,7 +402,10 @@ def _cross_source_rows_match(
     """Return (matches, time_diff_sec, payee_matched) for two cross-source tx rows."""
     if row_a["account_name"] != row_b["account_name"]:
         return False, 999999, False
-    if row_a["tx_date"] != row_b["tx_date"]:
+    da = date.fromisoformat(str(row_a["tx_date"]))
+    db_dt = date.fromisoformat(str(row_b["tx_date"]))
+    day_delta = abs((da - db_dt).days)
+    if day_delta > 1:
         return False, 999999, False
     src_a = str(row_a["source"])
     src_b = str(row_b["source"])
@@ -407,7 +453,7 @@ def _cross_source_rows_match(
     masked_b = _is_masked_payee(cb)
 
     exact_or_sub = False
-    if len(ca) >= 3 and len(cb) >= 3 and not masked_a and not masked_b:
+    if len(ca) >= 2 and len(cb) >= 2 and not masked_a and not masked_b:
         exact_or_sub = (ca == cb) or (
             len(ca) >= 4 and len(cb) >= 4 and (ca in cb or cb in ca)
         )
@@ -426,19 +472,28 @@ def _cross_source_rows_match(
 
     ta = _parse_time_seconds(row_a["tx_timestamp"])
     tb = _parse_time_seconds(row_b["tx_timestamp"])
+    if day_delta == 1:
+        # Cross-midnight / T+1 settlement only matches with explicit payee confirmation
+        if not payee_match:
+            return False, 999999, False
+        return True, 86400, True
+
     if ta is not None and tb is not None:
         diff_sec = abs(ta - tb)
         if diff_sec <= 300:
             if (
                 not masked_a
                 and not masked_b
-                and len(ca) >= 4
-                and len(cb) >= 4
+                and len(ca) >= 2
+                and len(cb) >= 2
                 and not payee_match
                 and not (_canonical_tokens(ca) & _canonical_tokens(cb))
             ):
                 return False, diff_sec, False
             return True, diff_sec, payee_match
+        # Both rows have real non-midnight times > 1 hour apart -> separate same-day transactions
+        if diff_sec > 3600:
+            return False, diff_sec, payee_match
 
     if payee_match:
         fallback_diff = abs(ta - tb) if (ta is not None and tb is not None) else 86400
@@ -495,6 +550,7 @@ class DatabaseManager:
 
     def __init__(self, db_path: str | Path = "data/treasury.db") -> None:
         self._lock = threading.RLock()
+        self.cloud_boot_restore_failed: bool = False
         raw_path = str(db_path)
         self._is_memory = raw_path == ":memory:" or raw_path.startswith("file::memory:")
         self.db_path: str | Path = raw_path if self._is_memory else Path(db_path)
@@ -568,6 +624,16 @@ class DatabaseManager:
                             self.conn.execute(
                                 "ALTER TABLE accounts ADD COLUMN balance_as_of TEXT"
                             )
+                        rule_cols = {
+                            r["name"]
+                            for r in self.conn.execute(
+                                "PRAGMA table_info(category_rules)"
+                            ).fetchall()
+                        }
+                        if "target_account" not in rule_cols:
+                            self.conn.execute(
+                                "ALTER TABLE category_rules ADD COLUMN target_account TEXT"
+                            )
                         self._seed_defaults_if_empty()
                         self._reconcile_existing_duplicates_and_payees_unlocked()
                         self.conn.commit()
@@ -581,37 +647,54 @@ class DatabaseManager:
                     continue
                 raise
 
-        self._auto_restore_from_cloud_if_empty()
+        restored = self._auto_restore_from_cloud_if_empty()
+        if restored:
+            with self._lock, self.conn:
+                self._reconcile_existing_duplicates_and_payees_unlocked()
 
     @property
     def change_counter(self) -> int:
         """Return cumulative SQLite INSERT/UPDATE/DELETE count for dirty-state tracking."""
         return int(self.conn.total_changes)
 
-    def _auto_restore_from_cloud_if_empty(self) -> None:
-        """Auto-restore encrypted cloud snapshot when starting on an empty non-memory DB."""
+    def _auto_restore_from_cloud_if_empty(self) -> bool:
+        """Auto-restore encrypted cloud snapshot only on a fresh untouched empty DB."""
         if self._is_memory:
-            return
+            return False
         auto_restore = get_secret("TREASURY_AUTO_RESTORE", "1").lower()
         if auto_restore in {"0", "false", "no", "off"}:
-            return
+            return False
         if not get_cloud_sync_status().get("configured"):
-            return
+            return False
         with self._lock:
             tx_empty = self._table_is_empty("transactions")
-        if not tx_empty:
-            return
+            if not tx_empty:
+                return False
+            # Do not wipe user-calibrated wallets/budgets if they configured them before adding txs
+            cal_row = self.conn.execute(
+                "SELECT 1 FROM accounts WHERE balance_as_of IS NOT NULL OR opening_balance != 0.0 LIMIT 1"
+            ).fetchone()
+            if cal_row is not None:
+                return False
         try:
             ok, msg = self.restore_from_cloud_vault()
             if ok:
                 logger.info("Auto-restored ledger from encrypted cloud vault: %s", msg)
+                self.cloud_boot_restore_failed = False
+                return True
             else:
+                msg_low = msg.lower()
+                if any(k in msg_low for k in ("failed", "network", "error", "timeout", "http")):
+                    self.cloud_boot_restore_failed = True
                 logger.info("Skipped cloud auto-restore: %s", redact_sensitive_text(msg))
+                return False
         except Exception as exc:
+            self.cloud_boot_restore_failed = True
             logger.warning(
                 "Cloud auto-restore error ignored during init: %s",
                 redact_sensitive_text(exc),
             )
+            return False
 
     def _seed_defaults_if_empty(self) -> None:
         """Populate default wallets, config, category budgets, rules, and bills if empty."""
@@ -802,12 +885,14 @@ class DatabaseManager:
 
     @staticmethod
     def _row_to_category_rule(row: sqlite3.Row) -> CategoryRule:
+        tgt = row["target_account"] if "target_account" in row.keys() else None
         return CategoryRule(
             id=row["id"],
             keyword=row["keyword"],
             merchant_alias=row["merchant_alias"],
             category=row["category"],
             cost_bucket=row["cost_bucket"],
+            target_account=tgt,
             priority=int(row["priority"]),
             is_user_defined=bool(row["is_user_defined"]),
             created_at=row["created_at"],
@@ -871,11 +956,7 @@ class DatabaseManager:
             row["account_name"]: float(row["opening_balance"]) for row in acct_rows
         }
         as_of_map: dict[str, Optional[str]] = {
-            row["account_name"]: (
-                str(row["balance_as_of"]).strip().replace("T", " ")[:19]
-                if row["balance_as_of"]
-                else None
-            )
+            row["account_name"]: normalize_balance_as_of(row["balance_as_of"])
             for row in acct_rows
         }
 
@@ -919,7 +1000,7 @@ class DatabaseManager:
                 if _applies(mmf_target, eff_ts):
                     balances[mmf_target] += amount
 
-        now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now_ts = get_local_now().replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
         for account_name, bal in balances.items():
             self.conn.execute(
                 "UPDATE accounts SET current_balance = ?, updated_at = ? WHERE account_name = ?",
@@ -973,28 +1054,25 @@ class DatabaseManager:
             return self._row_to_wallet(row)
 
     def _resolve_live_anchor_ts_unlocked(self) -> str:
-        """Return a current-time anchor timestamp >= any recently-bumped same-day tx_timestamp."""
-        now_dt = datetime.now()
-        today_str = now_dt.strftime("%Y-%m-%d")
+        """Return a current PKT anchor timestamp >= any recently-bumped same-day tx_timestamp."""
+        now_dt = get_local_now().replace(tzinfo=None)
         anchor_ts = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+        horizon_ts = (now_dt + timedelta(seconds=15)).strftime("%Y-%m-%d %H:%M:%S")
         row = self.conn.execute(
             """
             SELECT MAX(tx_timestamp) AS max_ts
             FROM transactions
-            WHERE tx_timestamp IS NOT NULL AND tx_timestamp LIKE ?
+            WHERE tx_timestamp IS NOT NULL
+              AND tx_timestamp > ?
+              AND tx_timestamp <= ?
             """,
-            (f"{today_str}%",),
+            (anchor_ts, horizon_ts),
         ).fetchone()
         max_tx_raw = row["max_ts"] if row and row["max_ts"] else None
         if max_tx_raw:
             max_tx_ts = str(max_tx_raw).strip().replace("T", " ")[:19]
             if len(max_tx_ts) == 19 and max_tx_ts > anchor_ts:
-                try:
-                    tx_dt = datetime.strptime(max_tx_ts, "%Y-%m-%d %H:%M:%S")
-                except ValueError:
-                    return anchor_ts
-                if (tx_dt - now_dt).total_seconds() <= 15.0:
-                    return max_tx_ts
+                return max_tx_ts
         return anchor_ts
 
     def calibrate_wallet_current_balance(
@@ -1014,11 +1092,9 @@ class DatabaseManager:
         )
         with self._lock, self.conn:
             if as_of is not None:
-                anchor_ts = as_of.strip()
-                if len(anchor_ts) == 10:
-                    anchor_ts = f"{anchor_ts} 23:59:59"
-                anchor_ts = anchor_ts.replace("T", " ")[:19]
-                datetime.strptime(anchor_ts, "%Y-%m-%d %H:%M:%S")
+                anchor_ts = normalize_balance_as_of(as_of)
+                if anchor_ts is None:
+                    raise ValueError("as_of cannot be blank when provided")
             else:
                 anchor_ts = self._resolve_live_anchor_ts_unlocked()
 
@@ -1064,16 +1140,18 @@ class DatabaseManager:
     def _find_cross_source_duplicate_unlocked(
         self, tx: TransactionRecord
     ) -> Optional[sqlite3.Row]:
-        """Find an existing cross-source transaction matching date, wallet, amount, and time/payee."""
+        """Find an existing cross-source (or same-source duplicate alert) matching date/wallet/amount/payee."""
         if tx.source not in _INGESTION_SOURCES:
             return None
         candidates = self.conn.execute(
             """
             SELECT * FROM transactions
-            WHERE account_name = ? AND tx_date = ? AND source != ?
+            WHERE account_name = ?
+              AND tx_date BETWEEN date(?, '-1 day') AND date(?, '+1 day')
+              AND source != ?
             ORDER BY id ASC
             """,
-            (tx.account_name, tx.tx_date, tx.source),
+            (tx.account_name, tx.tx_date, tx.tx_date, tx.source),
         ).fetchall()
 
         tx_dict = tx.model_dump()
@@ -1132,13 +1210,26 @@ class DatabaseManager:
         dupe_tax = round(float(dupe["tax_fee_amount"] or 0.0), 2)
         balance_dirty = False
         if (
-            next_tax == 0.0
+            str(keeper["tx_type"]) != "CREDIT"
+            and next_tax == 0.0
             and dupe_tax > 0.0
             and abs(next_amount - (dupe_amt + dupe_tax)) <= 0.01
         ):
             next_amount = dupe_amt
             next_tax = dupe_tax
             balance_dirty = True
+
+        # Upgrade midnight (date-only) keeper timestamp if duplicate provides real time-of-day
+        next_ts = keeper["tx_timestamp"]
+        if (
+            str(keeper["tx_date"]) == str(dupe["tx_date"])
+            and _parse_time_seconds(keeper["tx_timestamp"]) is None
+            and _parse_time_seconds(dupe["tx_timestamp"]) is not None
+        ):
+            dupe_hhmmss = str(dupe["tx_timestamp"]).strip().replace("T", " ")[11:19]
+            if len(dupe_hhmmss) == 8:
+                next_ts = f"{keeper['tx_date']} {dupe_hhmmss}"
+                balance_dirty = True
 
         next_tx_type = str(keeper["tx_type"])
         next_target = keeper["target_account"]
@@ -1183,7 +1274,8 @@ class DatabaseManager:
         self.conn.execute(
             """
             UPDATE transactions
-            SET tx_type = ?,
+            SET tx_timestamp = ?,
+                tx_type = ?,
                 target_account = ?,
                 is_internal_transfer = ?,
                 amount = ?,
@@ -1199,6 +1291,7 @@ class DatabaseManager:
             WHERE id = ?
             """,
             (
+                next_ts,
                 next_tx_type,
                 next_target,
                 next_internal,
@@ -1236,9 +1329,14 @@ class DatabaseManager:
                 removed_bogus += 1
                 balances_dirty = True
 
-        # 2. Clean raw subject-line & masked payees on existing Gmail rows
+        # 2. Clean raw subject-line & masked payees on unverified Gmail rows
         gmail_rows = self.conn.execute(
-            "SELECT id, payee, raw_subject FROM transactions WHERE source IN ('GMAIL_NAYAPAY', 'GMAIL_HMB')"
+            """
+            SELECT id, payee, raw_subject
+            FROM transactions
+            WHERE source IN ('GMAIL_NAYAPAY', 'GMAIL_HMB')
+              AND review_status != 'MANUALLY_VERIFIED'
+            """
         ).fetchall()
         for row in gmail_rows:
             cur_payee = str(row["payee"] or "")
@@ -1293,8 +1391,13 @@ class DatabaseManager:
                 )
                 normalized_rules += 1
             else:
+                # Keep the higher-(priority, id) user rule `r`, retire the older colliding rule
                 self.conn.execute(
-                    "DELETE FROM category_rules WHERE id = ?", (r["id"],)
+                    "DELETE FROM category_rules WHERE id = ?", (collision["id"],)
+                )
+                self.conn.execute(
+                    "UPDATE category_rules SET keyword = ? WHERE id = ?",
+                    (canon_kw, r["id"]),
                 )
                 normalized_rules += 1
 
@@ -1352,21 +1455,28 @@ class DatabaseManager:
             id_b = int(row_b["id"])
             if id_a in retired_ids or id_b in retired_ids:
                 continue
-            if _keep_rank(row_a) >= _keep_rank(row_b):
-                keeper_row, dupe_row = row_a, row_b
+            fresh_a = self.conn.execute(
+                "SELECT * FROM transactions WHERE id = ?", (id_a,)
+            ).fetchone()
+            fresh_b = self.conn.execute(
+                "SELECT * FROM transactions WHERE id = ?", (id_b,)
+            ).fetchone()
+            if not fresh_a or not fresh_b:
+                continue
+            # Re-verify match on fresh DB rows (respecting any newly added [alt_src:...] tags)
+            cross_ok, _, _ = _cross_source_rows_match(fresh_a, fresh_b)
+            if not cross_ok and not _same_source_alert_duplicate_match(fresh_a, fresh_b):
+                continue
+            if _keep_rank(fresh_a) >= _keep_rank(fresh_b):
+                keeper_row, dupe_row = fresh_a, fresh_b
             else:
-                keeper_row, dupe_row = row_b, row_a
+                keeper_row, dupe_row = fresh_b, fresh_a
             keeper_id = int(keeper_row["id"])
             dupe_id = int(dupe_row["id"])
             dupe_src = str(dupe_row["source"])
             if dupe_src != str(keeper_row["source"]) and dupe_src in reconciled_sources.get(keeper_id, set()):
                 continue
-            fresh_keeper = self.conn.execute(
-                "SELECT * FROM transactions WHERE id = ?", (keeper_id,)
-            ).fetchone()
-            if not fresh_keeper:
-                continue
-            self._reconcile_cross_source_row_unlocked(fresh_keeper, dupe_row)
+            self._reconcile_cross_source_row_unlocked(keeper_row, dupe_row)
             self.conn.execute("DELETE FROM transactions WHERE id = ?", (dupe_id,))
             retired_ids.add(dupe_id)
             reconciled_sources.setdefault(keeper_id, set()).add(dupe_src)
@@ -1454,22 +1564,29 @@ class DatabaseManager:
             return self._reconcile_existing_duplicates_and_payees_unlocked()
 
     def _insert_tx_ignore(self, tx: TransactionRecord) -> Optional[int]:
-        dup_id_row = self.conn.execute(
-            """
-            SELECT id FROM transactions
-            WHERE message_id = ?
-               OR COALESCE(notes, '') LIKE ? ESCAPE '\\'
-               OR COALESCE(notes, '') LIKE ? ESCAPE '\\'
-            LIMIT 1
-            """,
-            (
-                tx.message_id,
-                f"%[alt_id:{_escape_like(tx.message_id)}]%",
-                f"%[paired:{_escape_like(tx.message_id)} %",
-            ),
-        ).fetchone()
-        if dup_id_row is not None:
-            return None
+        candidate_ids = [tx.message_id]
+        if tx.message_id.startswith("XGM_") and tx.message_id[4:].isdigit():
+            candidate_ids.append(format(int(tx.message_id[4:]), "x"))
+        elif re.fullmatch(r"[0-9a-fA-F]{12,16}", tx.message_id):
+            candidate_ids.append(f"XGM_{int(tx.message_id, 16)}")
+
+        for cid in candidate_ids:
+            dup_id_row = self.conn.execute(
+                """
+                SELECT id FROM transactions
+                WHERE message_id = ?
+                   OR COALESCE(notes, '') LIKE ? ESCAPE '\\'
+                   OR COALESCE(notes, '') LIKE ? ESCAPE '\\'
+                LIMIT 1
+                """,
+                (
+                    cid,
+                    f"%[alt_id:{_escape_like(cid)}]%",
+                    f"%[paired:{_escape_like(cid)} %",
+                ),
+            ).fetchone()
+            if dup_id_row is not None:
+                return None
 
         cross_match = self._find_cross_source_duplicate_unlocked(tx)
         if cross_match is not None:
@@ -1580,38 +1697,9 @@ class DatabaseManager:
         """Create and persist a manual transaction with auto-categorization when omitted."""
         clean_amount = _validate_finite_float(amount, "amount")
         clean_tax = _validate_finite_float(tax_fee_amount, "tax_fee_amount")
-        clean_ts = tx_timestamp
+        explicit_ts = tx_timestamp
         with self._lock:
             self._validate_accounts_unlocked(account_name, tx_type, target_account)
-            if clean_ts is None:
-                now_dt = datetime.now()
-                today_str = now_dt.strftime("%Y-%m-%d")
-                if tx_date.strip()[:10] == today_str:
-                    clean_ts = now_dt.strftime("%Y-%m-%d %H:%M:%S")
-                    acct_rows = self.conn.execute(
-                        "SELECT balance_as_of FROM accounts WHERE account_name IN (?, ?)",
-                        (account_name, target_account or ""),
-                    ).fetchall()
-                    max_cutoff = max(
-                        (
-                            str(r["balance_as_of"]).strip().replace("T", " ")[:19]
-                            for r in acct_rows
-                            if r["balance_as_of"]
-                        ),
-                        default=None,
-                    )
-                    if (
-                        max_cutoff
-                        and clean_ts <= max_cutoff
-                        and max_cutoff[:10] == today_str
-                    ):
-                        cutoff_dt = datetime.strptime(
-                            max_cutoff, "%Y-%m-%d %H:%M:%S"
-                        )
-                        if abs((cutoff_dt - now_dt).total_seconds()) <= 5.0:
-                            clean_ts = (cutoff_dt + timedelta(seconds=1)).strftime(
-                                "%Y-%m-%d %H:%M:%S"
-                            )
 
         msg_id = f"MANUAL_{uuid4()}"
         if category is None:
@@ -1620,7 +1708,7 @@ class DatabaseManager:
             parsed = ParsedTransaction(
                 message_id=msg_id,
                 tx_date=tx_date,
-                tx_timestamp=clean_ts,
+                tx_timestamp=explicit_ts,
                 account_name=account_name,
                 target_account=target_account,
                 tx_type=tx_type,
@@ -1645,7 +1733,7 @@ class DatabaseManager:
             record = TransactionRecord(
                 message_id=msg_id,
                 tx_date=tx_date,
-                tx_timestamp=clean_ts,
+                tx_timestamp=explicit_ts,
                 account_name=account_name,
                 target_account=target_account,
                 tx_type=tx_type,
@@ -1665,6 +1753,32 @@ class DatabaseManager:
             self._validate_accounts_unlocked(
                 record.account_name, record.tx_type, record.target_account
             )
+            if explicit_ts is None:
+                now_dt = get_local_now().replace(tzinfo=None)
+                today_str = now_dt.strftime("%Y-%m-%d")
+                if record.tx_date == today_str:
+                    clean_ts = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+                    acct_rows = self.conn.execute(
+                        "SELECT balance_as_of FROM accounts WHERE account_name IN (?, ?)",
+                        (record.account_name, record.target_account or ""),
+                    ).fetchall()
+                    cutoffs = [
+                        c
+                        for c in (normalize_balance_as_of(r["balance_as_of"]) for r in acct_rows)
+                        if c is not None
+                    ]
+                    max_cutoff = max(cutoffs, default=None)
+                    if (
+                        max_cutoff
+                        and clean_ts <= max_cutoff
+                        and max_cutoff[:10] == today_str
+                    ):
+                        cutoff_dt = datetime.strptime(max_cutoff, "%Y-%m-%d %H:%M:%S")
+                        if abs((cutoff_dt - now_dt).total_seconds()) <= 5.0 and max_cutoff[11:] < "23:59:59":
+                            clean_ts = (cutoff_dt + timedelta(seconds=1)).strftime(
+                                "%Y-%m-%d %H:%M:%S"
+                            )
+                    record.tx_timestamp = clean_ts
             row_id = self._insert_tx_ignore(record)
             if row_id is None:
                 raise RuntimeError("Failed to insert manual transaction")
@@ -1824,10 +1938,15 @@ class DatabaseManager:
             elif new_tx_type == "DEBIT":
                 merged_data["target_account"] = None
                 merged_data["is_internal_transfer"] = False
-                if (
-                    existing.cost_bucket in ("INFLOW", "IGNORE", "INVESTMENT")
-                    and "cost_bucket" not in fields
+                if str(merged_data.get("cost_bucket") or "") in (
+                    "INFLOW",
+                    "IGNORE",
+                    "INVESTMENT",
                 ):
+                    if "cost_bucket" in fields:
+                        raise ValueError(
+                            f"DEBIT transactions cannot use cost_bucket '{merged_data.get('cost_bucket')}'."
+                        )
                     merged_data["cost_bucket"] = (
                         self._infer_bucket_for_category_unlocked(
                             str(merged_data.get("category") or "Uncategorized"),
@@ -1889,7 +2008,7 @@ class DatabaseManager:
 
     def get_available_months(self) -> list[str]:
         """Return distinct YYYY-MM months present in transactions plus current month, sorted DESC."""
-        current_month = date.today().strftime("%Y-%m")
+        current_month = get_local_now().strftime("%Y-%m")
         with self._lock:
             rows = self.conn.execute(
                 """
@@ -1901,6 +2020,41 @@ class DatabaseManager:
         months = {row["month_key"] for row in rows if row["month_key"]}
         months.add(current_month)
         return sorted(months, reverse=True)
+
+    def has_any_transactions(self) -> bool:
+        """Return True if at least one transaction exists without hydrating Pydantic models."""
+        with self._lock:
+            row = self.conn.execute("SELECT 1 FROM transactions LIMIT 1").fetchone()
+        return row is not None
+
+    def get_needs_review_count(self) -> int:
+        """Return total NEEDS_REVIEW count via lightweight SQL COUNT(*)."""
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS cnt FROM transactions WHERE review_status = 'NEEDS_REVIEW'"
+            ).fetchone()
+        return int(row["cnt"]) if row else 0
+
+    def get_month_transaction_counts(self) -> dict[str, int]:
+        """Return {YYYY-MM: count} via lightweight SQL GROUP BY."""
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT substr(tx_date, 1, 7) AS month_key, COUNT(*) AS cnt
+                FROM transactions
+                WHERE length(tx_date) >= 7
+                GROUP BY month_key
+                """
+            ).fetchall()
+        return {str(r["month_key"]): int(r["cnt"]) for r in rows if r["month_key"]}
+
+    def get_distinct_categories(self) -> list[tuple[str, str]]:
+        """Return distinct (category, cost_bucket) pairs from transactions via SQL."""
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT DISTINCT category, cost_bucket FROM transactions"
+            ).fetchall()
+        return [(str(r["category"]), str(r["cost_bucket"])) for r in rows if r["category"]]
 
     # ------------------------------------------------------------------
     # Budget Config, Category Budgets, Category Rules & Recurring Bills
@@ -2007,6 +2161,11 @@ class DatabaseManager:
             is_active=is_active,
         )
         with self._lock, self.conn:
+            existing_ci = self.conn.execute(
+                "SELECT id, category FROM category_budgets WHERE LOWER(category) = LOWER(?)",
+                (validated.category,),
+            ).fetchone()
+            target_cat = str(existing_ci["category"]) if existing_ci else validated.category
             self.conn.execute(
                 """
                 INSERT INTO category_budgets (category, emoji, cost_bucket, monthly_limit, is_active)
@@ -2018,7 +2177,7 @@ class DatabaseManager:
                     is_active = excluded.is_active
                 """,
                 (
-                    validated.category,
+                    target_cat,
                     validated.emoji,
                     validated.cost_bucket,
                     round(validated.monthly_limit, 2),
@@ -2027,7 +2186,7 @@ class DatabaseManager:
             )
             row = self.conn.execute(
                 "SELECT * FROM category_budgets WHERE category = ?",
-                (validated.category,),
+                (target_cat,),
             ).fetchone()
             return self._row_to_category_budget(row)
 
@@ -2100,7 +2259,7 @@ class DatabaseManager:
                     "UPDATE recurring_commitments SET category = ? WHERE category = ?",
                     (validated.category, old_name),
                 )
-            if validated.cost_bucket in ("FIXED", "VARIABLE", "LEAKAGE", "INFLOW", "IGNORE"):
+            if validated.cost_bucket in ("FIXED", "VARIABLE", "LEAKAGE", "INFLOW", "IGNORE", "INVESTMENT"):
                 self.conn.execute(
                     "UPDATE category_rules SET cost_bucket = ? WHERE category = ?",
                     (validated.cost_bucket, validated.category),
@@ -2195,6 +2354,8 @@ class DatabaseManager:
 
         candidates: list[tuple[int, int, dict[str, Any]]] = []
         for out_tx in outgoing:
+            if out_tx.tx_type == "TRANSFER_INTERNAL" and "[paired:" in (out_tx.notes or ""):
+                continue
             out_dt = date.fromisoformat(out_tx.tx_date)
             for in_tx in incoming:
                 if out_tx.account_name == in_tx.account_name:
@@ -2212,7 +2373,7 @@ class DatabaseManager:
                 diff_days = abs((out_dt - in_dt).days)
                 if diff_days > day_window:
                     continue
-                if out_tx.tx_type == "DEBIT" and _is_salary_like(in_tx):
+                if _is_salary_like(in_tx):
                     continue
                 cue = _transfer_cue_score(out_tx, in_tx)
                 mode = (
@@ -2263,15 +2424,29 @@ class DatabaseManager:
                 raise ValueError("One or both selected transfer transactions no longer exist.")
             out_tx = self._row_to_tx(out_row)
             in_tx = self._row_to_tx(in_row)
+            if out_tx.tx_type not in ("DEBIT", "TRANSFER_INTERNAL"):
+                raise ValueError("Outgoing transfer leg must be a DEBIT or TRANSFER_INTERNAL transaction.")
             if in_tx.tx_type != "CREDIT":
                 raise ValueError("Incoming mirror leg must be a CREDIT transaction.")
             if out_tx.account_name == in_tx.account_name:
                 raise ValueError("Own-account transfer pair must involve two different wallets.")
+            if (
+                out_tx.tx_type == "TRANSFER_INTERNAL"
+                and out_tx.target_account
+                and out_tx.target_account != in_tx.account_name
+            ):
+                raise ValueError("Outgoing TRANSFER_INTERNAL already targets a different wallet.")
             if abs(out_tx.amount - in_tx.amount) > 0.01:
                 raise ValueError("Transfer pair amounts do not match.")
 
             target = in_tx.account_name
-            if target == WALLET_NAYAPAY:
+            is_mmf = target == WALLET_MMF
+            new_type = "TRANSFER_MMF" if is_mmf else "TRANSFER_INTERNAL"
+            new_bucket = "INVESTMENT" if is_mmf else "IGNORE"
+            new_internal = 0 if is_mmf else 1
+            if is_mmf:
+                cat = "Money Market Fund"
+            elif target == WALLET_NAYAPAY:
                 cat = "Wallet Top-Up"
             elif target == WALLET_CASH:
                 cat = "Cash Withdrawal"
@@ -2281,22 +2456,38 @@ class DatabaseManager:
                 cat = "Internal Transfer"
 
             pair_tag = f"[paired:{in_tx.message_id} {in_tx.tx_date}]"
-            existing_notes = (out_tx.notes or "").strip()
-            merged_notes = f"{existing_notes} {pair_tag}".strip() if pair_tag not in existing_notes else existing_notes
+            merged_notes = (out_tx.notes or "").strip()
+            if pair_tag not in merged_notes:
+                merged_notes = f"{merged_notes} {pair_tag}".strip()
+            for tag in _STRUCTURED_TAG_RE.findall(in_tx.notes or ""):
+                if tag not in merged_notes:
+                    merged_notes = f"{merged_notes} {tag}".strip()
+
+            next_ts = out_tx.tx_timestamp
+            if (
+                out_tx.tx_date == in_tx.tx_date
+                and _parse_time_seconds(out_tx.tx_timestamp) is None
+                and _parse_time_seconds(in_tx.tx_timestamp) is not None
+                and in_tx.tx_timestamp
+            ):
+                hhmmss = in_tx.tx_timestamp.strip().replace("T", " ")[11:19]
+                if len(hhmmss) == 8:
+                    next_ts = f"{out_tx.tx_date} {hhmmss}"
 
             self.conn.execute(
                 """
                 UPDATE transactions
-                SET tx_type = 'TRANSFER_INTERNAL',
+                SET tx_type = ?,
+                    tx_timestamp = ?,
                     target_account = ?,
                     category = ?,
-                    cost_bucket = 'IGNORE',
-                    is_internal_transfer = 1,
+                    cost_bucket = ?,
+                    is_internal_transfer = ?,
                     review_status = 'MANUALLY_VERIFIED',
                     notes = ?
                 WHERE id = ?
                 """,
-                (target, cat, merged_notes, out_tx_id),
+                (new_type, next_ts, target, cat, new_bucket, new_internal, merged_notes, out_tx_id),
             )
             self.conn.execute(
                 "DELETE FROM transactions WHERE id = ?",
@@ -2310,18 +2501,34 @@ class DatabaseManager:
             return self._row_to_tx(updated_row)
 
     def auto_link_internal_transfer_mirrors(self, day_window: int = 1) -> int:
-        """Auto-merge high-confidence TRANSFER_INTERNAL + mirror CREDIT pairs so target wallets aren't double-credited."""
+        """Auto-merge corroborated TRANSFER_INTERNAL + mirror CREDIT pairs without deleting unrelated inflows."""
         linked_count = 0
         for pair in self.find_internal_transfer_pairs(day_window=day_window):
             if pair.get("mode") != "MERGE_DUPLICATE_CREDIT":
-                continue
-            if pair.get("confidence") != "High":
                 continue
             out_tx = pair.get("out_tx")
             in_tx = pair.get("in_tx")
             if not out_tx or not in_tx or out_tx.id is None or in_tx.id is None:
                 continue
+            if "[paired:" in (out_tx.notes or ""):
+                continue
             if out_tx.tx_type != "TRANSFER_INTERNAL" or out_tx.target_account != in_tx.account_name:
+                continue
+            # Require corroborating evidence: either explicit bank/transfer cue OR tight timestamp proximity
+            out_txt = f"{out_tx.payee} {out_tx.merchant_alias or ''} {out_tx.payment_channel or ''}".lower()
+            in_txt = f"{in_tx.payee} {in_tx.merchant_alias or ''} {in_tx.payment_channel or ''}".lower()
+            has_cue = (
+                out_tx.account_name.lower() in in_txt
+                or in_tx.account_name.lower() in out_txt
+                or any(k in in_txt or k in out_txt for k in ("raast", "ibft", "top-up", "topup", "own", "self"))
+            )
+            ts_close = False
+            if out_tx.tx_date == in_tx.tx_date:
+                to_s = _parse_time_seconds(out_tx.tx_timestamp)
+                ti_s = _parse_time_seconds(in_tx.tx_timestamp)
+                if to_s is not None and ti_s is not None and abs(ti_s - to_s) <= 1800:
+                    ts_close = True
+            if not (has_cue or ts_close):
                 continue
             self.link_internal_transfer_pair(int(out_tx.id), int(in_tx.id))
             linked_count += 1
@@ -2343,13 +2550,14 @@ class DatabaseManager:
         self.conn.execute(
             """
             INSERT INTO category_rules (
-                keyword, merchant_alias, category, cost_bucket, priority, is_user_defined
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                keyword, merchant_alias, category, cost_bucket, target_account, priority, is_user_defined
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(keyword) DO UPDATE SET
                 keyword = excluded.keyword,
                 merchant_alias = excluded.merchant_alias,
                 category = excluded.category,
                 cost_bucket = excluded.cost_bucket,
+                target_account = COALESCE(excluded.target_account, category_rules.target_account),
                 priority = excluded.priority,
                 is_user_defined = excluded.is_user_defined
             """,
@@ -2358,6 +2566,7 @@ class DatabaseManager:
                 validated.merchant_alias,
                 validated.category,
                 validated.cost_bucket,
+                validated.target_account,
                 validated.priority,
                 int(validated.is_user_defined),
             ),
@@ -2396,6 +2605,13 @@ class DatabaseManager:
         if len(clean_kw) < 3:
             raise ValueError("Learned rule keyword must be at least 3 characters")
 
+        valid_accounts = {
+            r["account_name"]
+            for r in self.conn.execute("SELECT account_name FROM accounts").fetchall()
+        }
+        if target_account is not None and target_account not in valid_accounts:
+            raise ValueError(f"Unknown wallet account: '{target_account}'")
+
         updated_count = 0
         balances_dirty = False
         rows = self.conn.execute(
@@ -2418,7 +2634,12 @@ class DatabaseManager:
             if source_tx_type is not None:
                 if source_tx_type == "CREDIT" and tx_type != "CREDIT":
                     continue
-                if source_tx_type == "DEBIT" and tx_type == "CREDIT":
+                if source_tx_type == "DEBIT" and tx_type != "DEBIT":
+                    continue
+                if source_tx_type == "TRANSFER_MMF" and tx_type not in (
+                    "DEBIT",
+                    "TRANSFER_MMF",
+                ):
                     continue
                 if source_tx_type == "TRANSFER_INTERNAL" and tx_type not in (
                     "DEBIT",
@@ -2454,14 +2675,14 @@ class DatabaseManager:
                     cost_bucket == "IGNORE"
                     and target_account
                     and row["account_name"] != target_account
-                    and (target_account != WALLET_MMF or row["account_name"] == WALLET_MMF)
+                    and target_account != WALLET_MMF
                 ):
                     tx_type = "TRANSFER_INTERNAL"
                     next_target = target_account
                     is_internal = 1
                     effective_bucket = "IGNORE"
                     balances_dirty = True
-                elif cost_bucket == "INFLOW":
+                elif cost_bucket in ("INFLOW", "IGNORE", "INVESTMENT"):
                     effective_bucket = self._infer_bucket_for_category_unlocked(
                         category, "DEBIT"
                     )
@@ -2561,14 +2782,51 @@ class DatabaseManager:
         """Insert or update a recurring commitment."""
         validated = RecurringCommitment.model_validate(commitment)
         with self._lock, self.conn:
-            if validated.id is not None:
-                cur = self.conn.execute(
+            try:
+                if validated.id is not None:
+                    cur = self.conn.execute(
+                        """
+                        UPDATE recurring_commitments SET
+                            title = ?, match_keyword = ?, expected_amount = ?, due_day = ?,
+                            category = ?, cost_bucket = ?, is_paid_this_month = ?,
+                            last_paid_month = ?, is_active = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            validated.title,
+                            validated.match_keyword,
+                            round(validated.expected_amount, 2),
+                            validated.due_day,
+                            validated.category,
+                            validated.cost_bucket,
+                            int(validated.is_paid_this_month),
+                            validated.last_paid_month,
+                            int(validated.is_active),
+                            validated.id,
+                        ),
+                    )
+                    if cur.rowcount > 0:
+                        row = self.conn.execute(
+                            "SELECT * FROM recurring_commitments WHERE id = ?",
+                            (validated.id,),
+                        ).fetchone()
+                        return self._row_to_recurring(row)
+
+                self.conn.execute(
                     """
-                    UPDATE recurring_commitments SET
-                        title = ?, match_keyword = ?, expected_amount = ?, due_day = ?,
-                        category = ?, cost_bucket = ?, is_paid_this_month = ?,
-                        last_paid_month = ?, is_active = ?
-                    WHERE id = ?
+                    INSERT INTO recurring_commitments (
+                        title, match_keyword, expected_amount, due_day,
+                        category, cost_bucket, is_paid_this_month, last_paid_month, is_active
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(title) DO UPDATE SET
+                        match_keyword = excluded.match_keyword,
+                        expected_amount = excluded.expected_amount,
+                        due_day = excluded.due_day,
+                        category = excluded.category,
+                        cost_bucket = excluded.cost_bucket,
+                        is_paid_this_month = excluded.is_paid_this_month,
+                        last_paid_month = excluded.last_paid_month,
+                        is_active = excluded.is_active
                     """,
                     (
                         validated.title,
@@ -2580,44 +2838,12 @@ class DatabaseManager:
                         int(validated.is_paid_this_month),
                         validated.last_paid_month,
                         int(validated.is_active),
-                        validated.id,
                     ),
                 )
-                if cur.rowcount > 0:
-                    row = self.conn.execute(
-                        "SELECT * FROM recurring_commitments WHERE id = ?",
-                        (validated.id,),
-                    ).fetchone()
-                    return self._row_to_recurring(row)
-
-            self.conn.execute(
-                """
-                INSERT INTO recurring_commitments (
-                    title, match_keyword, expected_amount, due_day,
-                    category, cost_bucket, is_paid_this_month, last_paid_month, is_active
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(title) DO UPDATE SET
-                    match_keyword = excluded.match_keyword,
-                    expected_amount = excluded.expected_amount,
-                    due_day = excluded.due_day,
-                    category = excluded.category,
-                    cost_bucket = excluded.cost_bucket,
-                    is_paid_this_month = excluded.is_paid_this_month,
-                    last_paid_month = excluded.last_paid_month,
-                    is_active = excluded.is_active
-                """,
-                (
-                    validated.title,
-                    validated.match_keyword,
-                    round(validated.expected_amount, 2),
-                    validated.due_day,
-                    validated.category,
-                    validated.cost_bucket,
-                    int(validated.is_paid_this_month),
-                    validated.last_paid_month,
-                    int(validated.is_active),
-                ),
-            )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError(
+                    f"Another recurring bill named '{validated.title}' already exists."
+                ) from exc
             row = self.conn.execute(
                 "SELECT * FROM recurring_commitments WHERE title = ?",
                 (validated.title,),
@@ -2636,41 +2862,34 @@ class DatabaseManager:
     def mark_recurring_paid(
         self, commitment_id: int, is_paid: bool, month_key: Optional[str] = None
     ) -> None:
-        """Update payment status flags monotonically for a recurring commitment."""
+        """Idempotently sync recurring payment flags (no-op writes do not advance total_changes)."""
         with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT is_paid_this_month, last_paid_month FROM recurring_commitments WHERE id = ?",
+                (commitment_id,),
+            ).fetchone()
+            if not row:
+                return
+            cur_paid = int(row["is_paid_this_month"])
+            cur_last = row["last_paid_month"]
             if is_paid:
+                next_last = cur_last
+                if month_key and (cur_last is None or month_key > cur_last):
+                    next_last = month_key
+                if cur_paid == 1 and cur_last == next_last:
+                    return
                 self.conn.execute(
-                    """
-                    UPDATE recurring_commitments
-                    SET is_paid_this_month = 1,
-                        last_paid_month = CASE
-                            WHEN ? IS NULL THEN last_paid_month
-                            WHEN last_paid_month IS NULL OR ? > last_paid_month THEN ?
-                            ELSE last_paid_month
-                        END
-                    WHERE id = ?
-                    """,
-                    (month_key, month_key, month_key, commitment_id),
+                    "UPDATE recurring_commitments SET is_paid_this_month = 1, last_paid_month = ? WHERE id = ?",
+                    (next_last, commitment_id),
                 )
             else:
-                if month_key:
-                    self.conn.execute(
-                        """
-                        UPDATE recurring_commitments
-                        SET is_paid_this_month = 0,
-                            last_paid_month = CASE
-                                WHEN last_paid_month = ? THEN NULL
-                                ELSE last_paid_month
-                            END
-                        WHERE id = ?
-                        """,
-                        (month_key, commitment_id),
-                    )
-                else:
-                    self.conn.execute(
-                        "UPDATE recurring_commitments SET is_paid_this_month = 0 WHERE id = ?",
-                        (commitment_id,),
-                    )
+                next_last = None if (month_key and cur_last == month_key) else cur_last
+                if cur_paid == 0 and cur_last == next_last:
+                    return
+                self.conn.execute(
+                    "UPDATE recurring_commitments SET is_paid_this_month = 0, last_paid_month = ? WHERE id = ?",
+                    (next_last, commitment_id),
+                )
 
     # ------------------------------------------------------------------
     # Backups, Restore & Exports
@@ -2973,8 +3192,8 @@ class DatabaseManager:
                     """
                     INSERT INTO category_rules (
                         id, keyword, merchant_alias, category, cost_bucket,
-                        priority, is_user_defined, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')))
+                        target_account, priority, is_user_defined, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')))
                     """,
                     (
                         r.id,
@@ -2982,6 +3201,7 @@ class DatabaseManager:
                         r.merchant_alias,
                         r.category,
                         r.cost_bucket,
+                        r.target_account,
                         r.priority,
                         int(r.is_user_defined),
                         r.created_at,

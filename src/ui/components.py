@@ -248,11 +248,12 @@ def render_category_budget_bars(category_progress: list[CategoryProgress]) -> No
                 if item.remaining < 0
                 else f"{format_pkr(item.remaining)} left"
             )
-            over_badge = (
-                '<span class="ptos-over-badge">Over Budget!</span>'
-                if item.utilization_pct > 95.0
-                else ""
-            )
+            if item.utilization_pct > 100.0:
+                over_badge = '<span class="ptos-over-badge">Over Budget!</span>'
+            elif item.utilization_pct > 95.0:
+                over_badge = '<span class="ptos-near-badge">Near Limit</span>'
+            else:
+                over_badge = ""
             pct_label = f"{item.utilization_pct:.1f}%"
         else:
             limit_text = f"{format_pkr(item.spent)} / No limit"
@@ -351,15 +352,26 @@ def render_upcoming_bills_widget(
     items_html: list[str] = [header_html, '<div class="ptos-bills-list">']
     for status in upcoming_bills:
         c = status.commitment
-        if status.is_paid:
+        short_due = (
+            status.due_date[5:]
+            if status.due_date and len(status.due_date) >= 10
+            else f"Day {c.due_day}"
+        )
+        if status.is_paid or status.status == "PAID":
             badge_cls = "ptos-bill-paid"
             short_dt = status.paid_date[5:] if status.paid_date and len(status.paid_date) >= 10 else status.paid_date
             badge_txt = f"✅ Paid {format_pkr(status.paid_amount)}" + (
                 f" ({short_dt})" if short_dt else ""
             )
+        elif status.status == "OVERDUE":
+            badge_cls = "ptos-bill-overdue"
+            badge_txt = f"⚠️ Overdue ({short_due})"
+        elif status.status == "DUE_SOON":
+            badge_cls = "ptos-bill-soon"
+            badge_txt = f"🔔 Due Soon ({short_due})"
         else:
             badge_cls = "ptos-bill-due"
-            badge_txt = f"⏳ Due Day {c.due_day}"
+            badge_txt = f"📅 Due {short_due}"
 
         items_html.append(
             _join_html(

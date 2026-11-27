@@ -54,24 +54,26 @@ _VALID_COST_BUCKETS: set[str] = {
 }
 
 _MONTH_NAME_PAT = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*"
-_LEADING_DATE_RE = re.compile(
-    rf"^\s*(?P<date>"
+_DATE_ATOM_PAT = (
+    rf"(?:"
     rf"\d{{4}}[-/]\d{{1,2}}[-/]\d{{1,2}}"
     rf"|\d{{1,2}}[-/ ]\d{{1,2}}[-/ ]\d{{2,4}}"
     rf"|\d{{1,2}}[-/ ]{_MONTH_NAME_PAT}[-/, ]+\d{{2,4}}"
     rf"|{_MONTH_NAME_PAT}[-/ ]+\d{{1,2}}[-/, ]+\d{{2,4}}"
     rf")"
+)
+_LEADING_DATE_RE = re.compile(
+    rf"^\s*(?P<date>{_DATE_ATOM_PAT})"
     r"(?:(?:[\s,T]+|[\s|,\-]+)(?P<time>\d{1,2}:\d{2}(?::\d{2})?(?:\s*[APap][Mm])?))?"
     r"(?P<rest>.*)$",
     re.IGNORECASE,
 )
+_LEADING_VALUE_DATE_RE = re.compile(
+    rf"^[\s|]*{_DATE_ATOM_PAT}\b[\s|,\-]*(?P<after>.*)$",
+    re.IGNORECASE,
+)
 _DATE_RANGE_CONTINUATION_RE = re.compile(
-    rf"^\s*(?:[-–—]|to\b)\s*(?:"
-    rf"\d{{4}}[-/]\d{{1,2}}[-/]\d{{1,2}}"
-    rf"|\d{{1,2}}[-/ ]\d{{1,2}}[-/ ]\d{{2,4}}"
-    rf"|\d{{1,2}}[-/ ]{_MONTH_NAME_PAT}[-/, ]+\d{{2,4}}"
-    rf"|{_MONTH_NAME_PAT}[-/ ]+\d{{1,2}}[-/, ]+\d{{2,4}}"
-    rf")\b",
+    rf"^\s*(?:[-–—]|to\b)\s*{_DATE_ATOM_PAT}\b",
     re.IGNORECASE,
 )
 _BARE_MONTH_YEAR_HEADER_RE = re.compile(
@@ -101,7 +103,11 @@ _PDF_HEADER_FOOTER_RE = re.compile(
 )
 _OPENING_BAL_RE = re.compile(
     r"(?i)\b(?:opening\s+bal(?:ance)?|brought\s+forward|b/f\s+bal(?:ance)?)\b"
-    r"[^\d\-+]{0,30}(?:PKR|Rs\.?)?\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)"
+    r"[^\d\-+]{0,30}(?:PKR|Rs\.?|PK\s*Rs\.?)?\s*([+\-]?[0-9][0-9,]*(?:\.[0-9]{1,2})?)"
+)
+_CLOSING_BAL_RE = re.compile(
+    r"(?i)\b(?:closing\s+bal(?:ance)?|carried\s+forward|c/f\s+bal(?:ance)?|ending\s+bal(?:ance)?)\b"
+    r"[^\d\-+]{0,30}(?:PKR|Rs\.?|PK\s*Rs\.?)?\s*([+\-]?[0-9][0-9,]*(?:\.[0-9]{1,2})?)"
 )
 
 _FOREIGN_CURR_CODES = r"(?:USD|EUR|GBP|AED|SAR|CAD|AUD|TRY|CNY|JPY)"
@@ -112,13 +118,15 @@ _FOREIGN_CURR_TOKEN_RE = re.compile(
 )
 
 _MONEY_TOKEN_RE = re.compile(
-    r"(?i)(?:(?<![A-Za-z0-9.\-])(?P<sign>[+\-])(?=(?:PKR|Rs\.?|PK\s*Rs\.?|[0-9]))"
+    r"(?i)(?:(?P<lparen>\()(?=\s*(?:PKR|Rs\.?|PK\s*Rs\.?)?\s*[0-9]))?"
+    r"(?:(?<![A-Za-z0-9.\-])(?P<sign>[+\-])(?=(?:PKR|Rs\.?|PK\s*Rs\.?|[0-9]))"
     r"|(?<=[\s|])(?P<sign_s1>[+\-])\s+(?=(?:PKR|Rs\.?|PK\s*Rs\.?|[0-9]{1,3}(?:,[0-9]{2,3})+(?:\.[0-9]{2})?|[0-9]+\.[0-9]{2}))"
     r"|(?<=^)(?P<sign_s2>[+\-])\s+(?=(?:PKR|Rs\.?|PK\s*Rs\.?|[0-9]{1,3}(?:,[0-9]{2,3})+(?:\.[0-9]{2})?|[0-9]+\.[0-9]{2})))?"
     r"(?:(?P<curr>PKR|Rs\.?|PK\s*Rs\.?)\s*)?"
     r"(?:(?<![A-Za-z0-9.\-])(?P<sign_s3>[+\-])(?=[0-9]))?"
     r"(?P<num>(?(curr)[0-9][0-9,]*(?:\.[0-9]{1,2})?|(?:[0-9]{1,3}(?:,[0-9]{2,3})+(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{2}))))"
     r"(?:/-)?"
+    r"(?P<rparen>\))?"
     r"(?:\s*(?P<drcr>DR|CR|Debit(?!\s+Card\b)|Credit(?!\s+Card\b))\b)?"
 )
 _EXPLICIT_CURR_OR_SIGNED_RE = re.compile(
@@ -143,9 +151,34 @@ _DEBIT_DESC_RE = re.compile(
 
 _TAX_FEE_DESC_RE = re.compile(
     r"(?i)\b(?:wht|withholding\s+tax|advance\s+tax|fx\s+fee|foreign\s+fee|"
+    r"fx\s+settlement(?:\s+costs?)?|sst(?:\s+on\s+int\.?)?|"
+    r"int\.?\s+transaction\s+fee|failed\s+int\.?\s+transaction|"
+    r"ibft\s+fee|card\s+replacement|issuance\s+fee|"
     r"service\s+fee|annual\s+fee|card\s+fee|sms\s+(?:alert\s+)?(?:fee|charges)|"
     r"bank\s+charges|fed|fbr\s+tax|surcharge|excise)\b"
 )
+
+_NUMERIC_DMY_SAMPLE_RE = re.compile(r"^\s*(\d{1,2})[-/](\d{1,2})[-/](\d{2,4})\b")
+
+
+def _infer_dayfirst_hint(date_samples: list[str]) -> Optional[bool]:
+    """Infer file-wide day-first vs month-first numeric date convention cleanly."""
+    has_first_gt_12 = False
+    has_second_gt_12 = False
+    for sample in date_samples:
+        m = _NUMERIC_DMY_SAMPLE_RE.match((sample or "").strip())
+        if not m:
+            continue
+        first_num, second_num = int(m.group(1)), int(m.group(2))
+        if first_num > 12:
+            has_first_gt_12 = True
+        if second_num > 12:
+            has_second_gt_12 = True
+    if has_first_gt_12:
+        return True
+    if has_second_gt_12 and not has_first_gt_12:
+        return False
+    return True
 
 
 def _normalize_account_name(account_hint: Optional[str]) -> Optional[str]:
@@ -259,17 +292,20 @@ def _build_pdf_message_id(
     amount: float,
     payee: str,
     occurrence_idx: int,
+    tx_type: str = "",
 ) -> str:
     """Generate deterministic PDF_{account}_{tx_date}_{sha256_12} identifier."""
     payee_clean = " ".join(payee.split()).strip()
-    key_tuple = (
+    key_parts = [
         account_name.strip().upper(),
         tx_date,
         f"{amount:.2f}",
-        payee_clean[:10].upper(),
+        payee_clean[:60].upper(),
         str(occurrence_idx),
-    )
-    digest = hashlib.sha256("|".join(key_tuple).encode("utf-8")).hexdigest()[:12]
+    ]
+    if tx_type and tx_type.strip():
+        key_parts.append(tx_type.strip().upper())
+    digest = hashlib.sha256("|".join(key_parts).encode("utf-8")).hexdigest()[:12]
     account_slug = re.sub(r"[^A-Za-z0-9]+", "", account_name).upper() or "BANK"
     return f"PDF_{account_slug}_{tx_date}_{digest}"
 
@@ -310,10 +346,10 @@ def _detect_channel_from_text(text: str) -> Optional[str]:
 
 
 _TRAILING_MONEY_END_RE = re.compile(
-    r"(?i)(?:(?:PKR|Rs\.?|PK\s*Rs\.?)\s*)?"
+    r"(?i)\(?(?:(?:PKR|Rs\.?|PK\s*Rs\.?)\s*)?"
     r"(?:[0-9]{1,3}(?:,[0-9]{2,3})+(?:\.[0-9]{2})|[0-9]+\.[0-9]{2}"
     r"|(?:PKR|Rs\.?|PK\s*Rs\.?)\s*[0-9][0-9,]*)"
-    r"(?:/-)?(?:\s*(?:DR|CR|Debit|Credit))?\s*$"
+    r"(?:/-)?\)?(?:\s*(?:DR|CR|Debit|Credit))?\s*$"
 )
 _NON_CONTINUATION_LINE_RE = re.compile(
     r"(?i)(?:^\s*(?:page|pg)\.?\s*\d+\b"
@@ -332,9 +368,9 @@ _STANDALONE_TIME_PREFIX_RE = re.compile(
     re.IGNORECASE,
 )
 _PURE_MONEY_LINE_RE = re.compile(
-    r"(?i)^\s*(?:[+\-]?\s*(?:(?:PKR|Rs\.?|PK\s*Rs\.?)\s*)?"
+    r"(?i)^\s*(?:\(?\s*[+\-]?\s*(?:(?:PKR|Rs\.?|PK\s*Rs\.?)\s*)?"
     r"(?:[0-9]{1,3}(?:,[0-9]{2,3})+(?:\.[0-9]{2})?|[0-9]+(?:\.[0-9]{2})?)"
-    r"(?:/-)?(?:\s*(?:DR|CR|Debit|Credit))?\s*)+$"
+    r"(?:/-)?\)?(?:\s*(?:DR|CR|Debit|Credit))?\s*)+$"
 )
 _FEE_DISCLOSURE_LINE_RE = re.compile(
     r"(?i)\b(?:service\s+charges?|fed|excise|wht|withholding|advance\s+tax|"
@@ -359,6 +395,8 @@ def _extract_pkr_money_tokens(scan_text: str) -> list[dict[str, Any]]:
             or gd.get("sign_s2")
             or gd.get("sign_s3")
         )
+        if not sign and gd.get("lparen") and gd.get("rparen"):
+            sign = "-"
         tokens.append(
             {
                 "start": m.start(),
@@ -411,13 +449,16 @@ def _looks_like_continuation_desc(line: str) -> bool:
     return True
 
 
-def _group_pdf_records(text: str) -> tuple[list[dict[str, Any]], Optional[float], bool]:
-    """Group PDF lines into structured transaction records, opening balance, and column order."""
+def _group_pdf_records(
+    text: str,
+) -> tuple[list[dict[str, Any]], Optional[float], Optional[float], bool]:
+    """Group PDF lines into structured transaction records, balances, and column order."""
     norm_text = _normalize_pdf_text(text)
     lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in norm_text.splitlines()]
     lines = [ln for ln in lines if ln]
 
     opening_balance: Optional[float] = None
+    closing_balance: Optional[float] = None
     credit_before_debit = False
     records: list[dict[str, Any]] = []
     current_rec: Optional[dict[str, Any]] = None
@@ -439,7 +480,14 @@ def _group_pdf_records(text: str) -> tuple[list[dict[str, Any]], Optional[float]
         if opening_balance is None:
             m_open = _OPENING_BAL_RE.search(ln)
             if m_open:
-                opening_balance = parse_amount_value(m_open.group(1))
+                opening_balance = round(float(m_open.group(1).replace(",", "")), 2)
+                _flush_current()
+                continue
+
+        if closing_balance is None:
+            m_close = _CLOSING_BAL_RE.search(ln)
+            if m_close:
+                closing_balance = round(float(m_close.group(1).replace(",", "")), 2)
                 _flush_current()
                 continue
 
@@ -457,7 +505,16 @@ def _group_pdf_records(text: str) -> tuple[list[dict[str, Any]], Optional[float]
             _flush_current()
             continue
 
-        if (_SUMMARY_SKIP_RE.search(ln) or _PDF_HEADER_FOOTER_RE.search(ln)) and not m_lead_line:
+        if _SUMMARY_SKIP_RE.search(ln) and not m_lead_line:
+            _flush_current()
+            continue
+
+        if _PDF_HEADER_FOOTER_RE.search(ln) and not m_lead_line:
+            if current_rec is not None and not _record_ends_with_money(
+                current_rec["parts"]
+            ):
+                # Mid-record page header/footer before amounts arrived: preserve open record
+                continue
             _flush_current()
             continue
 
@@ -513,12 +570,14 @@ def _group_pdf_records(text: str) -> tuple[list[dict[str, Any]], Optional[float]
             current_rec["parts"].append(ln)
 
     _flush_current()
-    return records, opening_balance, credit_before_debit
+    return records, opening_balance, closing_balance, credit_before_debit
 
 
 def _parse_pdf_record(
     rec_obj: dict[str, Any],
     credit_before_debit: bool,
+    *,
+    dayfirst_hint: Optional[bool] = True,
 ) -> Optional[
     tuple[
         str,
@@ -549,10 +608,21 @@ def _parse_pdf_record(
     raw_date = m_lead.group("date")
     raw_time = (m_lead.groupdict().get("time") or extra_time or "").strip()
     dt_input = f"{raw_date} {raw_time}".strip() if raw_time else raw_date
-    tx_date, tx_ts = normalize_datetime_str(dt_input)
+    try:
+        tx_date, tx_ts = normalize_datetime_str(
+            dt_input, allow_now_fallback=False, dayfirst_hint=dayfirst_hint
+        )
+    except ValueError:
+        return None
+
     rest = m_lead.group("rest").strip()
     if not rest or _DATE_RANGE_CONTINUATION_RE.match(rest):
         return None
+
+    # Strip secondary Value Date column if present immediately after Posting Date
+    m_val_date = _LEADING_VALUE_DATE_RE.match(rest)
+    if m_val_date and (m_val_date.group("after") or "").strip():
+        rest = m_val_date.group("after").strip()
 
     # Mask non-PKR foreign currency tokens with equal-length spaces to preserve offsets
     scan_rest = _FOREIGN_CURR_TOKEN_RE.sub(lambda m: " " * len(m.group(0)), rest)
@@ -627,10 +697,6 @@ def _parse_pdf_record(
         if amt_tok["val"] == 0 and bal_tok["val"] > 0:
             amount = bal_tok["val"]
             direction = "DEBIT" if credit_before_debit else "CREDIT"
-        elif bal_tok["val"] == 0 and amt_tok["val"] > 0:
-            amount = amt_tok["val"]
-            direction = None
-            new_balance = 0.0
         else:
             amount = amt_tok["val"]
             new_balance = bal_tok["val"]
@@ -684,6 +750,7 @@ def _parse_pdf_record(
 def _detect_descending_order(
     raw_rows: list[dict[str, Any]],
     opening_balance: Optional[float],
+    closing_balance: Optional[float] = None,
 ) -> bool:
     """Detect reverse-chronological (newest-first) row order from dates or balance equations."""
     inc_dates = 0
@@ -726,6 +793,14 @@ def _detect_descending_order(
             if abs((opening_balance + delta) - cur_bal) <= 1.0:
                 desc_score += 1
 
+    if closing_balance is not None and raw_rows:
+        first_bal = raw_rows[0]["new_bal"]
+        last_bal = raw_rows[-1]["new_bal"]
+        if last_bal is not None and abs(last_bal - closing_balance) <= 1.0:
+            asc_score += 1
+        if first_bal is not None and abs(first_bal - closing_balance) <= 1.0:
+            desc_score += 1
+
     return desc_score > asc_score
 
 
@@ -750,11 +825,19 @@ def _parse_bank_pdf_text(
     is_hmb: bool,
 ) -> list[ParsedTransaction]:
     """Shared PDF text parser for NayaPay and HabibMetro statements."""
-    records, opening_balance, credit_before_debit = _group_pdf_records(text)
-    raw_rows: list[dict[str, Any]] = []
-
+    records, opening_balance, closing_balance, credit_before_debit = _group_pdf_records(text)
+    date_samples: list[str] = []
     for rec in records:
-        parsed = _parse_pdf_record(rec, credit_before_debit)
+        m_d = _LEADING_DATE_RE.match(rec["text"])
+        if m_d:
+            date_samples.append(m_d.group("date"))
+    dayfirst_hint = _infer_dayfirst_hint(date_samples)
+
+    raw_rows: list[dict[str, Any]] = []
+    for rec in records:
+        parsed = _parse_pdf_record(
+            rec, credit_before_debit, dayfirst_hint=dayfirst_hint
+        )
         if parsed is None:
             continue
         tx_date, tx_ts, payee, direction, amount, new_bal, channel, rest, notes = parsed
@@ -776,9 +859,14 @@ def _parse_bank_pdf_text(
     if not raw_rows:
         return []
 
-    is_descending = _detect_descending_order(raw_rows, opening_balance)
+    is_descending = _detect_descending_order(raw_rows, opening_balance, closing_balance)
+    has_balance_col = (
+        opening_balance is not None
+        or closing_balance is not None
+        or any(r["new_bal"] is not None and r["new_bal"] > 0 for r in raw_rows)
+    )
 
-    occurrences: dict[tuple[str, str, str, str], int] = {}
+    occurrences: dict[tuple[str, str, str, str, str], int] = {}
     parsed_list: list[ParsedTransaction] = []
 
     for idx, item in enumerate(raw_rows):
@@ -806,7 +894,7 @@ def _parse_bank_pdf_text(
 
         if direction is None:
             # Handle 2-column Debit/Credit table where 2nd column was 0.00 (no Balance)
-            if new_bal == 0.0:
+            if new_bal == 0.0 and not has_balance_col:
                 direction = "CREDIT" if credit_before_debit else "DEBIT"
             else:
                 direction = _infer_fallback_pdf_direction(item["rest"], item["payee"])
@@ -837,16 +925,25 @@ def _parse_bank_pdf_text(
             suggested_category = "Bank & Tax Friction"
             suggested_bucket = "LEAKAGE"
 
+        payee_norm = " ".join(payee.split()).strip()[:60].upper()
         occ_key = (
             account_name.upper(),
             tx_date,
             f"{amount:.2f}",
-            payee[:10].upper(),
+            payee_norm,
+            tx_type,
         )
         occ_idx = occurrences.get(occ_key, 0)
         occurrences[occ_key] = occ_idx + 1
 
-        msg_id = _build_pdf_message_id(account_name, tx_date, amount, payee, occ_idx)
+        msg_id = _build_pdf_message_id(
+            account_name,
+            tx_date,
+            amount,
+            payee,
+            occ_idx,
+            tx_type=tx_type,
+        )
         parsed_list.append(
             ParsedTransaction(
                 message_id=msg_id,
@@ -897,17 +994,15 @@ def _normalize_col_name(col: str) -> str:
 
 
 def _find_csv_header_row(text: str) -> int:
-    """Locate the actual CSV table header row skipping bank metadata preamble lines."""
-    lines = text.splitlines()
-    date_pat = re.compile(r"\b(?:date|tx\s+date|timestamp)\b")
+    """Locate the actual CSV table header row index in csv.reader record space."""
+    date_pat = re.compile(r"\b(?:date|tx\s+date|timestamp|datetime)\b")
     money_pat = re.compile(
         r"\b(?:debit|credit|amount|withdrawal|withdrawals|deposit|deposits|dr|cr)\b"
     )
-    for idx, line in enumerate(lines[:30]):
-        try:
-            cells = next(csv.reader([line]))
-        except Exception:
-            continue
+    reader = csv.reader(io.StringIO(text))
+    for idx, cells in enumerate(reader):
+        if idx >= 30:
+            break
         non_empty = [c.strip() for c in cells if c.strip()]
         if len(non_empty) < 3:
             continue
@@ -992,11 +1087,11 @@ def _match_column(
 
 
 def _read_csv_rows_resilient(text: str, header_idx: int) -> tuple[list[str], list[dict[str, str]]]:
-    """Parse CSV table starting at header_idx while tolerating ragged summary footers."""
-    lines = text.splitlines()
-    if header_idx >= len(lines):
-        return [], []
-    reader = csv.reader(lines[header_idx:])
+    """Parse CSV table starting at header_idx while supporting multiline quoted cells."""
+    reader = csv.reader(io.StringIO(text))
+    for _ in range(max(0, header_idx)):
+        if next(reader, None) is None:
+            return [], []
 
     cols: list[str] = []
     for row in reader:
@@ -1032,6 +1127,7 @@ def _read_csv_rows_resilient(text: str, header_idx: int) -> tuple[list[str], lis
 def parse_statement_csv(
     content: bytes | str,
     account_hint: Optional[str] = None,
+    filename_hint: Optional[str] = None,
 ) -> list[ParsedTransaction]:
     """Parse a HabibMetro, NayaPay, or exported Treasury CSV statement into ParsedTransactions."""
     if isinstance(content, (bytes, bytearray)) and len(content) > _MAX_STATEMENT_BYTES:
@@ -1084,14 +1180,29 @@ def parse_statement_csv(
         cols, ("tx_type", "transaction type", "dr/cr", "drcr", "type")
     )
     drcr_excluded = {type_col} if type_col else set()
+    _non_amount_col_tokens = (
+        "card",
+        "no",
+        "number",
+        "id",
+        "ref",
+        "reference",
+        "type",
+        "account",
+        "title",
+        "status",
+        "code",
+    )
     debit_col = _match_column(
         cols,
         ("debit amount", "debit", "withdrawal", "withdrawals", "outflow", "dr"),
+        exclude_tokens=_non_amount_col_tokens,
         exclude_cols=drcr_excluded,
     )
     credit_col = _match_column(
         cols,
         ("credit amount", "credit", "deposit", "deposits", "inflow", "cr"),
+        exclude_tokens=_non_amount_col_tokens,
         exclude_cols=drcr_excluded,
     )
     tax_col = _match_column(
@@ -1131,10 +1242,22 @@ def parse_statement_csv(
     notes_col = _match_column(cols, ("notes", "note"))
     subject_col = _match_column(cols, ("raw_subject", "subject"))
 
-    default_account = _normalize_account_name(account_hint) or _detect_statement_wallet(text)
+    explicit_acct = _normalize_account_name(account_hint)
+    default_account = (
+        explicit_acct
+        or _normalize_account_name(filename_hint)
+        or _detect_statement_wallet(text, filename_hint or "")
+    )
     is_exported_backup = bool(type_col and target_col)
 
-    occurrences: dict[tuple[str, str, str, str], int] = {}
+    csv_date_samples: list[str] = []
+    for row in row_dicts:
+        sample_dt = str(row.get(date_col, "") or "").strip()
+        if sample_dt and sample_dt.lower() not in ("nan", "none"):
+            csv_date_samples.append(sample_dt)
+    dayfirst_hint = _infer_dayfirst_hint(csv_date_samples)
+
+    occurrences: dict[tuple[str, str, str, str, str], int] = {}
     results: list[ParsedTransaction] = []
 
     for row in row_dicts:
@@ -1161,7 +1284,9 @@ def parse_statement_csv(
         if not re.search(r"\d", dt_input):
             continue
         try:
-            tx_date, tx_ts = normalize_datetime_str(dt_input)
+            tx_date, tx_ts = normalize_datetime_str(
+                dt_input, allow_now_fallback=False, dayfirst_hint=dayfirst_hint
+            )
         except Exception:
             continue
 
@@ -1177,7 +1302,7 @@ def parse_statement_csv(
 
         row_acct = (
             _normalize_account_name(row.get(acct_col))
-            if acct_col and not account_hint
+            if (acct_col and not explicit_acct)
             else None
         )
         account_name = row_acct if row_acct in _CANONICAL_WALLETS else default_account
@@ -1208,7 +1333,15 @@ def parse_statement_csv(
             direction = "CREDIT"
             amount = round(credit_val, 2)
         elif amount_col:
-            raw_amt, amt_drcr = _parse_csv_number_and_drcr(row.get(amount_col))
+            raw_amt_cell = str(row.get(amount_col) or "").strip()
+            has_explicit_plus = bool(
+                re.match(
+                    r"^(?:(?:PKR|Rs\.?|PK\s*Rs\.?)\s*)?\+(?=\s*(?:PKR|Rs\.?|PK\s*Rs\.?)?\s*[0-9])",
+                    raw_amt_cell,
+                    re.IGNORECASE,
+                )
+            )
+            raw_amt, amt_drcr = _parse_csv_number_and_drcr(raw_amt_cell)
             if raw_amt == 0.0:
                 continue
             if explicit_tx_type == "CREDIT":
@@ -1217,11 +1350,13 @@ def parse_statement_csv(
                 direction = "DEBIT"
             elif raw_amt < 0:
                 direction = "DEBIT"
+            elif has_explicit_plus and raw_amt > 0:
+                direction = "CREDIT"
             elif amt_drcr is not None:
                 direction = amt_drcr
-            elif any(k in type_hint for k in ("credit", "cr", "deposit", "inflow")):
+            elif re.search(r"(?i)\b(?:credit|cr|deposit|inflow)\b", type_hint):
                 direction = "CREDIT"
-            elif any(k in type_hint for k in ("debit", "dr", "withdrawal", "outflow")):
+            elif re.search(r"(?i)\b(?:debit|dr|withdrawal|outflow)\b", type_hint):
                 direction = "DEBIT"
             elif _CREDIT_DESC_RE.search(payee) and not _DEBIT_DESC_RE.search(payee):
                 direction = "CREDIT"
@@ -1305,15 +1440,24 @@ def parse_statement_csv(
         if explicit_mid and explicit_mid.lower() not in ("nan", "none"):
             msg_id = explicit_mid
         else:
+            payee_norm = " ".join(payee.split()).strip()[:60].upper()
             occ_key = (
                 account_name.upper(),
                 tx_date,
                 f"{amount:.2f}",
-                payee[:10].upper(),
+                payee_norm,
+                tx_type,
             )
             occ_idx = occurrences.get(occ_key, 0)
             occurrences[occ_key] = occ_idx + 1
-            msg_id = _build_pdf_message_id(account_name, tx_date, amount, payee, occ_idx)
+            msg_id = _build_pdf_message_id(
+                account_name,
+                tx_date,
+                amount,
+                payee,
+                occ_idx,
+                tx_type=tx_type,
+            )
 
         merchant_alias = (
             _strip_csv_formula_guard(str(row.get(alias_col, "") or "").strip()) or None
@@ -1389,12 +1533,17 @@ def import_statement_file(
     norm_hint = _normalize_account_name(account_hint)
 
     if fname_lower.endswith(".csv"):
+        inferred_fname_hint: Optional[str] = None
         if norm_hint is None:
             if any(k in fname_lower for k in ("nayapay", "naya_pay", "naya-pay")):
-                norm_hint = WALLET_NAYAPAY
+                inferred_fname_hint = WALLET_NAYAPAY
             elif any(k in fname_lower for k in ("habib", "hmb")):
-                norm_hint = WALLET_HABIBMETRO
-        return parse_statement_csv(raw_bytes, account_hint=norm_hint)
+                inferred_fname_hint = WALLET_HABIBMETRO
+        return parse_statement_csv(
+            raw_bytes,
+            account_hint=norm_hint,
+            filename_hint=inferred_fname_hint or fname_lower,
+        )
 
     if fname_lower.endswith(".pdf"):
         if not raw_bytes:

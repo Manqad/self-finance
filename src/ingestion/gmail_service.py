@@ -10,6 +10,7 @@ import imaplib
 import logging
 import os
 import re
+import time
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any, Optional
@@ -27,7 +28,8 @@ SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 
 DEFAULT_GMAIL_QUERY = (
     '(from:nayapay OR from:habibmetro OR subject:"HabibMetro" '
-    'OR subject:"NayaPay" OR "HABIBMETRO" OR "Habib Metro E-Service")'
+    'OR subject:"NayaPay" OR "NayaPay" OR "HABIBMETRO" OR "Habib Metro E-Service" '
+    'OR "Habib Metro" OR "HabibMetropolitan")'
 )
 
 
@@ -266,8 +268,21 @@ def _fetch_via_oauth(
 
     service = build("gmail", "v1", credentials=creds, cache_discovery=False)
 
+    def _exec_with_retry(req: Any) -> Any:
+        for attempt in range(3):
+            try:
+                return req.execute()
+            except Exception as exc:
+                status_code = getattr(getattr(exc, "resp", None), "status", None)
+                if attempt < 2 and status_code in (429, 500, 502, 503, 504):
+                    time.sleep(0.5 * (2**attempt))
+                    continue
+                raise
+
     message_refs: list[dict[str, Any]] = []
     page_token: Optional[str] = None
+    if max_results <= 0:
+        return [], 0
     while len(message_refs) < max_results:
         batch_size = min(max_results - len(message_refs), 500)
         req_kwargs: dict[str, Any] = {
@@ -277,7 +292,7 @@ def _fetch_via_oauth(
         }
         if page_token:
             req_kwargs["pageToken"] = page_token
-        resp = service.users().messages().list(**req_kwargs).execute()
+        resp = _exec_with_retry(service.users().messages().list(**req_kwargs))
         message_refs.extend(resp.get("messages") or [])
         page_token = resp.get("nextPageToken")
         if not page_token:
@@ -294,11 +309,8 @@ def _fetch_via_oauth(
         if msg_id in known_set:
             continue
         try:
-            full_msg = (
-                service.users()
-                .messages()
-                .get(userId="me", id=msg_id, format="full")
-                .execute()
+            full_msg = _exec_with_retry(
+                service.users().messages().get(userId="me", id=msg_id, format="full")
             )
             payload = full_msg.get("payload") or {}
             headers = {
@@ -370,6 +382,38 @@ def _parse_imap_fetch_items(
     return items
 
 
+def _select_best_imap_mailbox(conn: Any) -> None:
+    """Select Gmail All Mail (for archived/filtered alerts) falling back cleanly to INBOX."""
+    candidates: list[str] = []
+    if hasattr(conn, "list"):
+        try:
+            l_typ, l_data = conn.list()
+            if l_typ == "OK" and l_data:
+                for entry in l_data:
+                    line = (
+                        entry.decode("utf-8", errors="replace")
+                        if isinstance(entry, (bytes, bytearray))
+                        else str(entry or "")
+                    )
+                    if "\\All" in line:
+                        m_box = re.search(r'"([^"]+)"\s*$', line.strip())
+                        if m_box:
+                            candidates.append(f'"{m_box.group(1)}"')
+        except Exception:
+            pass
+    for fallback_box in ('"[Gmail]/All Mail"', '"[Google Mail]/All Mail"', "INBOX"):
+        if fallback_box not in candidates:
+            candidates.append(fallback_box)
+    for box in candidates:
+        try:
+            s_typ, _ = conn.select(box, readonly=True)
+            if s_typ == "OK":
+                return
+        except Exception:
+            continue
+    raise RuntimeError("Failed to select any readable Gmail IMAP mailbox.")
+
+
 def _fetch_via_imap(
     max_results: int,
     query: str,
@@ -377,6 +421,9 @@ def _fetch_via_imap(
     known_message_ids: Optional[set[str]] = None,
 ) -> tuple[list[ParsedTransaction], int]:
     """Fetch and parse matching bank emails via Gmail IMAP SSL using batched UID fetches."""
+    if max_results <= 0:
+        return [], 0
+
     try:
         conn = imaplib.IMAP4_SSL("imap.gmail.com", 993, timeout=15)
     except TypeError:
@@ -384,13 +431,13 @@ def _fetch_via_imap(
 
     try:
         conn.login(cfg["gmail_user"], cfg["gmail_app_password"])
-        conn.select("INBOX", readonly=True)
+        _select_best_imap_mailbox(conn)
 
         msg_uids: list[bytes] = []
         gm_raw_ok = False
-        escaped_query = query.replace('"', '\\"')
+        safe_q = re.sub(r"[\r\n]+", " ", query or "").replace("\\", "\\\\").replace('"', '\\"')
         try:
-            typ, data = conn.uid("SEARCH", None, "X-GM-RAW", f'"{escaped_query}"')
+            typ, data = conn.uid("SEARCH", None, "X-GM-RAW", f'"{safe_q}"')
             if typ == "OK":
                 gm_raw_ok = True
                 if data and data[0]:
@@ -440,8 +487,8 @@ def _fetch_via_imap(
                     uids_to_fetch = [
                         uid
                         for uid in uids_to_fetch
-                        if f"XGM_{uid_to_gm[uid]}" not in known_set
                         if uid in uid_to_gm
+                        and f"XGM_{uid_to_gm[uid]}" not in known_set
                     ] + [uid for uid in uids_to_fetch if uid not in uid_to_gm]
             except Exception:
                 uids_to_fetch = list(target_uids)
@@ -451,38 +498,57 @@ def _fetch_via_imap(
         for start in range(0, len(uids_to_fetch), 25):
             chunk = uids_to_fetch[start : start + 25]
             uid_arg: bytes = chunk[0] if len(chunk) == 1 else b",".join(chunk)
-            msg_data = None
-            typ = "NO"
+            batch_items: list[tuple[Optional[str], bytes]] = []
             try:
                 typ, msg_data = conn.uid("FETCH", uid_arg, "(X-GM-MSGID BODY.PEEK[])")
+                if typ == "OK" and msg_data:
+                    batch_items = _parse_imap_fetch_items(msg_data)
             except Exception:
-                typ = "NO"
-            if typ != "OK" or not msg_data:
+                batch_items = []
+            if not batch_items:
                 try:
                     typ, msg_data = conn.uid("FETCH", uid_arg, "(BODY.PEEK[])")
+                    if typ == "OK" and msg_data:
+                        batch_items = _parse_imap_fetch_items(msg_data)
                 except Exception:
-                    typ = "NO"
-            if typ == "OK" and msg_data:
-                fetched_entries.extend(_parse_imap_fetch_items(msg_data))
+                    batch_items = []
+            if batch_items:
+                fetched_entries.extend(batch_items)
                 continue
 
             # Fallback to single-UID fetch only if a batch failed
             if len(chunk) > 1:
                 for single_uid in chunk:
                     try:
+                        s_items: list[tuple[Optional[str], bytes]] = []
                         s_typ, s_data = conn.uid("FETCH", single_uid, "(X-GM-MSGID BODY.PEEK[])")
-                        if s_typ != "OK" or not s_data:
-                            s_typ, s_data = conn.uid("FETCH", single_uid, "(BODY.PEEK[])")
                         if s_typ == "OK" and s_data:
-                            fetched_entries.extend(_parse_imap_fetch_items(s_data))
+                            s_items = _parse_imap_fetch_items(s_data)
+                        if not s_items:
+                            s_typ, s_data = conn.uid("FETCH", single_uid, "(BODY.PEEK[])")
+                            if s_typ == "OK" and s_data:
+                                s_items = _parse_imap_fetch_items(s_data)
+                        if s_items:
+                            fetched_entries.extend(s_items)
                     except Exception as exc:
                         logger.warning("Failed fetching IMAP UID %s: %s", single_uid, exc)
 
         for gm_msgid, raw_bytes in fetched_entries:
             try:
-                msg = email.message_from_bytes(
-                    raw_bytes, policy=email.policy.default
-                )
+                try:
+                    msg = email.message_from_bytes(
+                        raw_bytes, policy=email.policy.default
+                    )
+                    subject = str(msg.get("Subject") or "")
+                    sender = str(msg.get("From") or "")
+                    date_hdr = str(msg.get("Date") or "")
+                except Exception:
+                    msg = email.message_from_bytes(
+                        raw_bytes, policy=email.policy.compat32
+                    )
+                    subject = str(msg.get("Subject") or "")
+                    sender = str(msg.get("From") or "")
+                    date_hdr = str(msg.get("Date") or "")
                 raw_mid = str(msg.get("Message-ID") or "").strip().strip("<>")
                 if gm_msgid:
                     msg_id = f"XGM_{gm_msgid}"
@@ -496,11 +562,7 @@ def _fetch_via_imap(
                     continue
                 seen_ids.add(msg_id)
 
-                subject = str(msg.get("Subject") or "")
-                sender = str(msg.get("From") or "")
-                date_hdr = str(msg.get("Date") or "")
-                body = _extract_imap_body(msg)  # type: ignore[arg-type]
-
+                body = _extract_imap_body(msg)
                 tx = parse_email_payload(
                     message_id=msg_id,
                     subject=subject,
